@@ -1,5 +1,5 @@
 [project]
-name = "jax-fusion"
+name = "jax-flow"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -25,10 +25,10 @@ metal = [
 ]
 
 [tool.poetry]
-packages = [{ include = "jax_fusion", from = "src" }]
+packages = [{ include = "jax_flow", from = "src" }]
 
 [project.scripts]
-jax-fusion = "jax_fusion:main"
+jax-flow = "jax_flow:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
@@ -39,4 +39,4 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["jax_fusion*"]
+include = ["jax_flow*"]

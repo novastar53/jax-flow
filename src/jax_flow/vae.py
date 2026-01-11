@@ -8,8 +8,8 @@ import numpy as np
 import optax
 
 from typing import Optional
-#from jax_fusion.datasets.fashion_mnist import make_dataloader, visualize_batch, FASHION_LABELS
-from jax_fusion.datasets.celeb_a import DataConfig, make_dataloader, visualize_batch
+#from jax_flow.datasets.fashion_mnist import make_dataloader, visualize_batch, FASHION_LABELS
+from jax_flow.datasets.celeb_a import DataConfig, make_dataloader, visualize_batch
 
 train_it = make_dataloader("train")
 
@@ -109,5 +109,5 @@ for i, (x, labels) in enumerate(train_it):
     optimizer.update(m, grads)
     print(i, loss)
 
-from jax_fusion.generate import plot_samples as generic_plot
+from jax_flow.generate import plot_samples as generic_plot
 generic_plot(jax.random.PRNGKey(2000), None, decoder_wrapper, n_row=4, latent_dim=config.hidden_size)

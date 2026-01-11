@@ -9,7 +9,7 @@ Example:
     imgs, labels = next(it)
 
 Run demo:
-    python -m jax_fusion.datasets.fashion_mnist
+    python -m jax_flow.datasets.fashion_mnist
 """
 
 from __future__ import annotations

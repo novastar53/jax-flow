@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
 
-from jax_fusion.datasets.fashion_mnist import DataConfig, make_dataloader
+from jax_flow.datasets.fashion_mnist import DataConfig, make_dataloader
 
 cfg = DataConfig(batch_size=16, num_epochs=1, shuffle=True, as_chw=False, sample_size=64)
 it = make_dataloader("test", cfg)

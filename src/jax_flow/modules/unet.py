@@ -9,8 +9,8 @@ import flax.nnx as nnx
 import optax
 
 
-from jax_fusion.datasets.oxford_iiit_pet import DataConfig, make_dataloader, visualize_batch
-from jax_fusion.modules.pos_emb import PosEmbedding
+from jax_flow.datasets.oxford_iiit_pet import DataConfig, make_dataloader, visualize_batch
+from jax_flow.modules.pos_emb import PosEmbedding
 
 
 class ConvBlock(nnx.Module):

@@ -10,7 +10,7 @@ Example:
     imgs, labels, masks = next(it)
 
 Run demo:
-    python -m jax_fusion.datasets.oxford_iiit_pet
+    python -m jax_flow.datasets.oxford_iiit_pet
 """
 
 from __future__ import annotations
