@@ -71,7 +71,7 @@ class ManifoldAwareMLP(nn.Module):
         return self.predict(h)
 
 # 3. TRAINING LOOP
-def train_model(model, noisy_data, clean_targets, epochs=2000):
+def train_model(model, noisy_data, clean_targets, epochs=1000):
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss() # Simple regression loss for x-prediction [cite: 161, 709]
     
