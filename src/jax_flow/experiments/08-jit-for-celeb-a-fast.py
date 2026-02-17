@@ -24,7 +24,7 @@ matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 from datasets import load_dataset
 from PIL import Image
-from huggingface_hub import login, upload_folder
+from huggingface_hub import login, upload_folder, snapshot_download
 
 # Add jaxpt to path
 sys.path.insert(0, os.path.expanduser("~/dev/jaxpt/src"))
@@ -358,6 +358,27 @@ def create_model_and_optimizer(rng_key, config, mesh):
     return model, optimizer
 
 
+def download_checkpoint_from_hf(repo_id: str, local_dir: str) -> bool:
+    """Download checkpoint from HuggingFace Hub if available."""
+    try:
+        print(f"Checking for checkpoint at {repo_id}...", flush=True)
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            local_dir=local_dir,
+            allow_patterns=["*.nnx", "*.json"],
+        )
+        # Check if we actually got the checkpoint
+        checkpoint_path = os.path.join(local_dir, "model_state.nnx")
+        if os.path.exists(checkpoint_path):
+            print(f"Downloaded checkpoint from HuggingFace", flush=True)
+            return True
+        return False
+    except Exception as e:
+        print(f"Could not download from HuggingFace: {e}", flush=True)
+        return False
+
+
 def load_model_from_checkpoint(checkpoint_dir, config, mesh):
     """Load model from checkpoint if it exists."""
     checkpoint_path = os.path.join(checkpoint_dir, "model_state.nnx")
@@ -483,9 +504,18 @@ def main():
     rng = jax.random.PRNGKey(CONFIG['seed'])
     rng, init_rng = jax.random.split(rng)
 
-    # Check for existing checkpoint
+    # Check for existing checkpoint (local first, then HuggingFace)
     checkpoint_dir = "model_checkpoint"
+    hf_repo_id = "vikramp/jax_jit"
+
+    # First try loading from local checkpoint
     model, optimizer = load_model_from_checkpoint(checkpoint_dir, CONFIG, mesh)
+
+    # If no local checkpoint, try downloading from HuggingFace
+    if model is None:
+        print("No local checkpoint found. Checking HuggingFace Hub...", flush=True)
+        if download_checkpoint_from_hf(hf_repo_id, checkpoint_dir):
+            model, optimizer = load_model_from_checkpoint(checkpoint_dir, CONFIG, mesh)
 
     if model is None:
         print("No checkpoint found. Creating new model...", flush=True)
