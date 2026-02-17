@@ -24,6 +24,7 @@ matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 from datasets import load_dataset
 from PIL import Image
+from huggingface_hub import login, upload_folder
 
 # Add jaxpt to path
 sys.path.insert(0, os.path.expanduser("~/dev/jaxpt/src"))
@@ -506,6 +507,36 @@ def main():
     print("\n" + "="*60, flush=True)
     print("Training complete!", flush=True)
     print("="*60, flush=True)
+
+    # Save model checkpoint
+    print("\nSaving model checkpoint...", flush=True)
+    checkpoint_dir = "model_checkpoint"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Save model state
+    graphdef, state = nnx.split(model)
+    checkpoint_path = os.path.join(checkpoint_dir, "model_state.nnx")
+    nnx.state.save_checkpoint(checkpoint_path, state)
+
+    # Save config
+    import json
+    with open(os.path.join(checkpoint_dir, "config.json"), "w") as f:
+        json.dump(CONFIG, f, indent=2)
+
+    print(f"Checkpoint saved to {checkpoint_dir}/", flush=True)
+
+    # Upload to Hugging Face
+    print("\nUploading to Hugging Face...", flush=True)
+    try:
+        login()
+        upload_folder(
+            folder_path=checkpoint_dir,
+            repo_id="vikramp/jax_jit",
+            repo_type="model"
+        )
+        print("Successfully uploaded to Hugging Face!", flush=True)
+    except Exception as e:
+        print(f"Failed to upload to Hugging Face: {e}", flush=True)
 
 if __name__ == "__main__":
     main()
