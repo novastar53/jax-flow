@@ -6,6 +6,7 @@ Uses flax.nnx and optimized attention (cuDNN where available).
 
 import sys
 import os
+import json
 
 # Force unbuffered output for real-time logging
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1, encoding='utf-8', errors='replace')
@@ -539,16 +540,43 @@ def main():
     num_epochs = CONFIG['epochs']
     sample_every = 2000
 
+    # Checkpoint config
+    checkpoint_dir = os.path.abspath("model_checkpoint")
+    checkpoint_every_epochs = 1  # Save every N epochs (also saves at start and end)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    def save_checkpoint(model, optimizer, epoch):
+        """Save model checkpoint."""
+        print(f"\nSaving checkpoint at epoch {epoch}...", flush=True)
+
+        # Save model state using orbax
+        graphdef, state = nnx.split(model)
+        checkpoint_path = os.path.join(checkpoint_dir, "model_state")
+        cp = ocp.StandardCheckpointer()
+        cp.save(checkpoint_path, state)
+        cp.wait_until_finished()
+
+        # Save config
+        with open(os.path.join(checkpoint_dir, "config.json"), "w") as f:
+            json.dump(CONFIG, f, indent=2)
+
+        print(f"Checkpoint saved to {checkpoint_dir}/", flush=True)
+
     print(f"[4/5] Training configuration:", flush=True)
     print(f"      Steps per epoch: {steps_per_epoch}", flush=True)
     print(f"      Total epochs: {num_epochs}", flush=True)
     print(f"      Sample every: {sample_every} steps", flush=True)
+    print(f"      Checkpoint every: {checkpoint_every_epochs} epoch(s)", flush=True)
     print(f"\n{'='*60}", flush=True)
     print("[5/5] Starting training loop...", flush=True)
     print('='*60, flush=True)
 
     with mesh:
         global_step = 0
+
+        # Save initial checkpoint (epoch 0)
+        save_checkpoint(model, optimizer, 0)
+
         for epoch in range(num_epochs):
             print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===", flush=True)
 
@@ -588,28 +616,13 @@ def main():
 
                 global_step += 1
 
+            # Save checkpoint every N epochs (using modulus)
+            if (epoch + 1) % checkpoint_every_epochs == 0:
+                save_checkpoint(model, optimizer, epoch + 1)
+
     print("\n" + "="*60, flush=True)
     print("Training complete!", flush=True)
     print("="*60, flush=True)
-
-    # Save model checkpoint
-    print("\nSaving model checkpoint...", flush=True)
-    checkpoint_dir = os.path.abspath("model_checkpoint")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # Save model state using orbax
-    graphdef, state = nnx.split(model)
-    checkpoint_path = os.path.join(checkpoint_dir, "model_state")
-    cp = ocp.StandardCheckpointer()
-    cp.save(checkpoint_path, state)
-    cp.wait_until_finished()
-
-    # Save config
-    import json
-    with open(os.path.join(checkpoint_dir, "config.json"), "w") as f:
-        json.dump(CONFIG, f, indent=2)
-
-    print(f"Checkpoint saved to {checkpoint_dir}/", flush=True)
 
     # Upload to Hugging Face
     print("\nUploading to Hugging Face...", flush=True)
