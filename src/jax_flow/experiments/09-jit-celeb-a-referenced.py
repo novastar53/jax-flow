@@ -795,12 +795,17 @@ def main():
 
     data_sharding = NamedSharding(mesh, PartitionSpec("devices"))
 
+    # Training config (define before model creation)
+    steps_per_epoch = 162000 // CONFIG['batch_size']
+    num_epochs = CONFIG['epochs']
+    sample_every = 2000
+    total_steps = steps_per_epoch * num_epochs
+
     # Setup model
     print("[2/5] Initializing model...", flush=True)
     rng = jax.random.PRNGKey(CONFIG['seed'])
     rng, init_rng = jax.random.split(rng)
 
-    total_steps = steps_per_epoch * num_epochs
     model, optimizer = create_model_and_optimizer(init_rng, CONFIG, mesh, total_steps)
     print(f"    Model: {CONFIG['dim_model']}d, {CONFIG['depth']} layers", flush=True)
     print(f"    Batch size: {CONFIG['batch_size']}, LR: {CONFIG['lr']}", flush=True)
@@ -814,14 +819,10 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print(f"[3/5] Output directory: {output_dir}/", flush=True)
 
-    # Training config
-    steps_per_epoch = 162000 // CONFIG['batch_size']
-    num_epochs = CONFIG['epochs']
-    sample_every = 2000
-
     print(f"[4/5] Training configuration:", flush=True)
     print(f"      Steps per epoch: {steps_per_epoch}", flush=True)
     print(f"      Total epochs: {num_epochs}", flush=True)
+    print(f"      Total steps: {total_steps}", flush=True)
     print(f"      Sample every: {sample_every} steps", flush=True)
     print(f"\n{'='*60}", flush=True)
     print("[5/5] Starting training...", flush=True)
