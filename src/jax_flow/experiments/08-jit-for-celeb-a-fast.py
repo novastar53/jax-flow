@@ -206,10 +206,10 @@ class LinearBottleneckPatchEmbed(nnx.Module):
 
 class TransformerBlock(nnx.Module):
     def __init__(self, config: DenoiseConfig, rope_omega: nnx.Variable, rngs: nnx.Rngs):
-        # Use simple initializers - sharding handled by mesh context
-        self.ln1 = nnx.RMSNorm(config.n_embed, epsilon=config.ln_epsilon, rngs=rngs)
+        # Use LayerNorm to match 07 model
+        self.ln1 = nnx.LayerNorm(config.n_embed, epsilon=config.ln_epsilon, rngs=rngs)
         self.attn = SelfAttention_w_RoPE(config, rope_omega, rngs)  # Non-causal for images
-        self.ln2 = nnx.RMSNorm(config.n_embed, epsilon=config.ln_epsilon, rngs=rngs)
+        self.ln2 = nnx.LayerNorm(config.n_embed, epsilon=config.ln_epsilon, rngs=rngs)
         self.mlp = GLU(config, rngs)
 
     def __call__(self, x):
@@ -252,7 +252,7 @@ class DenoisingTransformer(nnx.Module):
         ])
 
         # Output head
-        self.ln_f = nnx.RMSNorm(config['dim_model'], epsilon=cfg.ln_epsilon, rngs=rngs)
+        self.ln_f = nnx.LayerNorm(config['dim_model'], epsilon=cfg.ln_epsilon, rngs=rngs)
         self.head = nnx.Linear(config['dim_model'], config['dim_raw'], use_bias=False, rngs=rngs)
 
     def __call__(self, x_noisy, t):
