@@ -828,6 +828,23 @@ def main():
         print(f"\nDebug - First batch: shape={first_batch.shape}, "
               f"range=[{first_batch.min():.3f}, {first_batch.max():.3f}]", flush=True)
 
+        # Generate a sample before training to verify sampling works
+        print("\nGenerating pre-training sample...", flush=True)
+        pretrain_sample = sample(model, rng, img_size=CONFIG['img_size'],
+                                 noise_scale=CONFIG['noise_scale'], t_eps=CONFIG['t_eps'])
+        img = np.array(pretrain_sample[0])
+        img = (img + 1.0) / 2.0
+        img = np.clip(img, 0, 1)
+        filepath = os.path.join(output_dir, "sample_pretraining.png")
+        plt.figure(figsize=(4, 4))
+        plt.imshow(img)
+        plt.axis('off')
+        plt.title("Pre-training Sample (Random Init)")
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Pre-training sample saved: {filepath}", flush=True)
+
         for epoch in range(num_epochs):
             print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===", flush=True)
             epoch_losses = []
