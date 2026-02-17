@@ -5,16 +5,17 @@ import os
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-import torch
 from flax.training import train_state
 import optax
 import numpy as np
 import math
 
 import matplotlib.pyplot as plt
+from datasets import load_dataset
+from PIL import Image
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from datasets.celeb_a import DataConfig, make_dataloader, visualize_batch
+import torch
+from torch.utils.data import DataLoader
 
 # ==========================================
 # 1. Configuration
@@ -223,40 +224,52 @@ class JustProteinTransformer(nn.Module):
         return self.patch_embed_layer(x)
 
 
-# Assuming your dataloader file is named 'celeba_loader.py'
-# or you paste the class directly above this function.
-# form celeba_loader import DataConfig, make_dataloader 
+def celeba_generator_hf(split="train", batch_size=32, img_size=64):
+    """
+    HuggingFace-based CelebA dataloader for the JIT Flow Matching model.
+    Uses the huggan/CelebA-faces dataset which is more reliable than Google Drive.
+    """
+    # Load CelebA from HuggingFace (streaming mode to avoid disk space issues)
+    print(f"Loading CelebA dataset from HuggingFace (split={split})...")
+    ds = load_dataset("huggan/CelebA-faces", split="train", streaming=True)
 
-def celeba_generator(split="train", batch_size=32, img_size=64):
-    """
-    Adapts the specific CelebA dataloader for the JIT Flow Matching model.
-    """
-    # 1. Configure for JAX/Flax (HWC format is standard for Linear projections)
-    cfg = DataConfig(
-        batch_size=batch_size,
-        image_size=(img_size, img_size),
-        shuffle=True,
-        drop_last=True,
-        as_chw=False,   # CRITICAL: Set to False to get (B, H, W, 3)
-        num_epochs=None # Infinite if the loader supports it, otherwise we loop externally
-    )
-    
+    # Convert to list for easier batching (CelebA has ~200k images)
+    # For memory efficiency, we'll batch as we iterate
+    ds_iterator = iter(ds)
+
     while True:
-        # Create a fresh iterator if the previous one exhausts
-        # (Your dataloader seems to load once and iterate, which is fine)
-        loader = make_dataloader(split, cfg)
-        
-        for batch_imgs, batch_labels in loader:
-            # batch_imgs is currently [0, 1]
-            
-            # 2. Rescale to [-1, 1] for Flow Matching
-            # (x * 2) - 1
-            batch_centered = (batch_imgs * 2.0) - 1.0
-            
-            # 3. Ensure float32
-            batch_centered = batch_centered.astype(jnp.float32)
-            
-            yield batch_centered
+        batch_imgs = []
+        for _ in range(batch_size):
+            try:
+                sample = next(ds_iterator)
+                img = sample["image"]
+
+                # Resize to target size
+                img = img.resize((img_size, img_size))
+
+                # Convert PIL to numpy array [H, W, C]
+                img_array = np.array(img).astype(np.float32) / 255.0  # [0, 1]
+
+                # Ensure 3 channels (some images might be grayscale)
+                if len(img_array.shape) == 2:
+                    img_array = np.stack([img_array] * 3, axis=-1)
+                elif img_array.shape[-1] == 4:  # RGBA
+                    img_array = img_array[:, :, :3]
+
+                batch_imgs.append(img_array)
+            except StopIteration:
+                # Restart iterator if exhausted
+                ds_iterator = iter(ds)
+                break
+
+        if len(batch_imgs) == batch_size:
+            # Stack into batch [B, H, W, C]
+            batch = np.stack(batch_imgs, axis=0)
+
+            # Rescale to [-1, 1] for Flow Matching
+            batch = (batch * 2.0) - 1.0
+
+            yield batch
 
 def sample_protein(state, rng, img_size, steps=100):
     """
@@ -344,7 +357,7 @@ def train_step(state, batch, rng):
 def main():
     # --- 1. Setup Data ---
     # Initialize the adapter
-    train_gen = celeba_generator(split="train",
+    train_gen = celeba_generator_hf(split="train",
                                 batch_size=CONFIG['batch_size'],
                                 img_size=CONFIG['img_size'])
 
