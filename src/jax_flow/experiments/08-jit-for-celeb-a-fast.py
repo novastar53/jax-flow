@@ -68,7 +68,7 @@ class DenoiseConfig(Config):
         self.ln_epsilon = 1e-6
         self.init_stddev = 0.02
         self.rope_base_freq = 10000.0
-        self.dtype = jnp.float32
+        self.dtype = jnp.bfloat16  # cuDNN attention requires fp16/bf16/fp8
         self.param_dtype = jnp.float32
         self.use_cache = False
 
