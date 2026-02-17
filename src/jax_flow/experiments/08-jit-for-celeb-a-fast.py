@@ -12,6 +12,7 @@ sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1, encoding='utf-8', 
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1, encoding='utf-8', errors='replace')
 
 import jax
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
 import jax.numpy as jnp
 import flax.nnx as nnx
 import optax
@@ -231,8 +232,8 @@ def celeba_generator_hf(split="train", batch_size=32, img_size=64):
 # 4. Training
 # ==========================================
 
-def create_train_state(rng_key, config):
-    """Create initial training state."""
+def create_model_and_optimizer(rng_key, config, mesh):
+    """Create model and optimizer with proper sharding."""
     rngs = nnx.Rngs(rng_key)
     model = DenoisingTransformer(config, rngs)
 
@@ -243,14 +244,26 @@ def create_train_state(rng_key, config):
     # Run once to initialize
     _ = model(dummy_x, dummy_t)
 
-    # Create optimizer
-    optimizer = optax.adamw(learning_rate=config['lr'])
-    state = nnx.Optimizer(model, optimizer)
+    # Create optimizer with weight decay mask (exclude biases and norms)
+    graphdef, params, _ = nnx.split(model, nnx.Param, nnx.Variable)
+    weight_decay_mask = jax.tree.map(
+        lambda x: len(x.value.shape) > 1,
+        params,
+        is_leaf=lambda n: isinstance(n, nnx.Param),
+    )
 
-    return state
+    tx = optax.adamw(
+        learning_rate=config['lr'],
+        weight_decay=0.1,
+        mask=weight_decay_mask,
+    )
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
-@jax.jit
-def train_step(state, batch, rng):
+    return model, optimizer
+
+
+@nnx.jit
+def train_step(model, optimizer, batch, rng):
     """Single training step with v-loss."""
     x_clean = batch
     B = x_clean.shape[0]
@@ -268,18 +281,18 @@ def train_step(state, batch, rng):
     t_bc = t.reshape((B, 1, 1, 1))
     x_t = (1 - t_bc) * x_noise + t_bc * x_clean
 
-    def loss_fn(model):
-        x_pred = model(x_t, t)
+    def loss_fn(m):
+        x_pred = m(x_t, t)
         # v-loss with x-prediction
         denom = jnp.clip(1 - t_bc, 0.05, 1.0)
         v_pred = (x_pred - x_t) / denom
         v_target = (x_clean - x_t) / denom
         return jnp.mean((v_pred - v_target) ** 2)
 
-    loss, grads = jax.value_and_grad(loss_fn)(state.model)
-    state.update(grads)
+    loss, grads = nnx.value_and_grad(loss_fn)(model)
+    optimizer.update(model, grads)
 
-    return state, loss, rng
+    return loss, rng
 
 def sample(model, rng, img_size, steps=100):
     """Generate samples using Euler method."""
@@ -307,75 +320,94 @@ def main():
     print("Optimized CelebA Flow Matching Training (jaxpt modules)", flush=True)
     print("=" * 60, flush=True)
 
+    # Setup devices and mesh
+    devices = jax.devices()
+    num_devices = len(devices)
+    print(f"\n[0/5] Device setup: {num_devices} device(s)", flush=True)
+    print(f"      Platform: {jax.default_backend()}", flush=True)
+    print(f"      Devices: {devices}", flush=True)
+    mesh = Mesh(devices, ["devices"])
+
     # Setup data
-    print("\n[1/4] Setting up data loader...", flush=True)
+    print("\n[1/5] Setting up data loader...", flush=True)
     train_gen = celeba_generator_hf(
         split="train",
         batch_size=CONFIG['batch_size'],
         img_size=CONFIG['img_size']
     )
 
+    # Create data sharding
+    data_sharding = NamedSharding(mesh, PartitionSpec("devices"))
+
     # Setup model
-    print("[2/4] Initializing model...", flush=True)
+    print("[2/5] Initializing model...", flush=True)
     rng = jax.random.PRNGKey(CONFIG['seed'])
     rng, init_rng = jax.random.split(rng)
-    state = create_train_state(init_rng, CONFIG)
+
+    with mesh:
+        model, optimizer = create_model_and_optimizer(init_rng, CONFIG, mesh)
+
     print(f"    Model initialized: {CONFIG['dim_model']}d, {CONFIG['depth']} layers", flush=True)
     print(f"    Using cuDNN attention: {jax.devices()[0].platform == 'gpu'}", flush=True)
 
     # Setup output
     output_dir = "generated_samples_fast"
     os.makedirs(output_dir, exist_ok=True)
-    print(f"[3/4] Output directory: {output_dir}/", flush=True)
+    print(f"[3/5] Output directory: {output_dir}/", flush=True)
 
     # Training config
     steps_per_epoch = 162000 // CONFIG['batch_size']
     num_epochs = CONFIG['epochs']
     sample_every = 2000
 
-    print(f"[4/4] Training configuration:", flush=True)
+    print(f"[4/5] Training configuration:", flush=True)
     print(f"      Steps per epoch: {steps_per_epoch}", flush=True)
     print(f"      Total epochs: {num_epochs}", flush=True)
     print(f"      Sample every: {sample_every} steps", flush=True)
     print(f"\n{'='*60}", flush=True)
-    print("Starting training loop...", flush=True)
+    print("[5/5] Starting training loop...", flush=True)
     print('='*60, flush=True)
 
-    global_step = 0
-    for epoch in range(num_epochs):
-        print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===", flush=True)
+    with mesh:
+        global_step = 0
+        for epoch in range(num_epochs):
+            print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===", flush=True)
 
-        for step_in_epoch in range(steps_per_epoch):
-            batch = next(train_gen)
-            state, loss, rng = train_step(state, batch, rng)
+            for step_in_epoch in range(steps_per_epoch):
+                batch = next(train_gen)
 
-            if step_in_epoch % 100 == 0:
-                print(f"Epoch {epoch + 1} | Step {step_in_epoch}/{steps_per_epoch} | "
-                      f"Global Step {global_step} | Loss: {loss:.5f}", flush=True)
+                # Put batch on devices
+                batch = jax.device_put(batch, data_sharding)
 
-            if global_step % sample_every == 0 and global_step > 0:
-                print(f"Sampling at global step {global_step} (epoch {epoch + 1})...", flush=True)
+                loss, rng = train_step(model, optimizer, batch, rng)
 
-                sample_out = sample(state.model, rng, img_size=CONFIG['img_size'])
+                if step_in_epoch % 100 == 0:
+                    print(f"Epoch {epoch + 1} | Step {step_in_epoch}/{steps_per_epoch} | "
+                          f"Global Step {global_step} | Loss: {loss:.5f}", flush=True)
 
-                img = np.array(sample_out[0])
-                img = (img + 1.0) / 2.0
-                img = np.clip(img, 0, 1)
+                if global_step % sample_every == 0 and global_step > 0:
+                    print(f"Sampling at global step {global_step} (epoch {epoch + 1})...", flush=True)
 
-                filename = f"sample_step{global_step:06d}_epoch{epoch + 1}.png"
-                filepath = os.path.join(output_dir, filename)
+                    sample_out = sample(model, rng, img_size=CONFIG['img_size'])
 
-                plt.figure(figsize=(4, 4))
-                plt.imshow(img)
-                plt.axis('off')
-                plt.title(f"Step {global_step}, Epoch {epoch + 1}")
-                plt.tight_layout()
-                plt.savefig(filepath, dpi=150, bbox_inches='tight')
-                plt.close()
+                    img = np.array(sample_out[0])
+                    img = (img + 1.0) / 2.0
+                    img = np.clip(img, 0, 1)
 
-                print(f"Saved: {filepath}", flush=True)
+                    filename = f"sample_step{global_step:06d}_epoch{epoch + 1}.png"
+                    filepath = os.path.join(output_dir, filename)
 
-            global_step += 1
+                    plt.figure(figsize=(4, 4))
+                    plt.imshow(img)
+                    plt.axis('off')
+                    plt.title(f"Step {global_step}, Epoch {epoch + 1}")
+                    plt.tight_layout()
+                    plt.savefig(filepath, dpi=150, bbox_inches='tight')
+                    plt.close()
+
+                    print(f"Saved: {filepath}", flush=True)
+
+                global_step += 1
 
     print("\n" + "="*60, flush=True)
     print("Training complete!", flush=True)
