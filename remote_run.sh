@@ -1,8 +1,14 @@
 #!/bin/bash
 # remote_run.sh - Run Python scripts on remote machines with log streaming
 #
-# Usage: ./remote_run.sh [-d] [-n SESSION] [-b BRANCH] <ssh-host> <script-path> [script-args...]
+# Usage: ./remote_run.sh [-d] [-n SESSION] [-b BRANCH] [-t HF_TOKEN] <ssh-host> <script-path> [script-args...]
 #        ./remote_run.sh <ssh-host> <command>
+#
+# Options:
+#   -d          Detach mode (don't attach to tmux session)
+#   -n SESSION  Set tmux session name (default: jax_fusion)
+#   -b BRANCH   Checkout specific git branch
+#   -t TOKEN    Set HuggingFace token (HF_TOKEN env var)
 #
 # Commands: attach, stream, status, stop
 
@@ -24,12 +30,14 @@ NC='\033[0m'
 DETACH=false
 SESSION_NAME="$DEFAULT_SESSION"
 GIT_REF=""
+HF_TOKEN=""
 
-while getopts "dn:b:" opt; do
+while getopts "dn:b:t:" opt; do
     case $opt in
         d) DETACH=true ;;
         n) SESSION_NAME="$OPTARG" ;;
         b) GIT_REF="$OPTARG" ;;
+        t) HF_TOKEN="$OPTARG" ;;
         \?) echo -e "${RED}Invalid option: -$OPTARG${NC}" >&2; exit 1 ;;
     esac
 done
@@ -107,6 +115,13 @@ EOF
 run_background() {
     local log_file="$REMOTE_LOG_DIR/${SESSION_NAME}_${TIMESTAMP}.log"
     echo -e "${GREEN}Starting script in background...${NC}"
+
+    # Build HF_TOKEN export if provided
+    local hf_export=""
+    if [ -n "$HF_TOKEN" ]; then
+        hf_export="export HF_TOKEN='$HF_TOKEN' && "
+    fi
+
     remote_exec "bash -l" << EOF
 set -e
 REMOTE_DIR=\$(eval echo ~/jax_fusion)
@@ -115,7 +130,7 @@ source \$HOME/.local/bin/env 2>/dev/null
 tmux kill-session -t $SESSION_NAME 2>/dev/null || true
 tmux new-session -d -s $SESSION_NAME -c "\$REMOTE_DIR"
 tmux send-keys -t $SESSION_NAME "source \$HOME/.local/bin/env 2>/dev/null" Enter
-tmux send-keys -t $SESSION_NAME "uv run python $SCRIPT_PATH $SCRIPT_ARGS 2>&1 | tee $log_file" Enter
+tmux send-keys -t $SESSION_NAME "${hf_export}uv run python $SCRIPT_PATH $SCRIPT_ARGS 2>&1 | tee $log_file" Enter
 echo "Session '$SESSION_NAME' started"
 EOF
     echo -e "${GREEN}Script running.${NC} Use: $0 $SSH_HOST attach"

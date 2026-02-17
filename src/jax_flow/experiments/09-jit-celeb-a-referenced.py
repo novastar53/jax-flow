@@ -7,6 +7,8 @@ Uses AdaLN modulation, SwiGLU, QK norm, and proper training configuration.
 import sys
 import os
 import json
+import threading
+import queue
 from datetime import datetime
 
 # Force unbuffered output for real-time logging
@@ -423,6 +425,36 @@ def celeba_generator_hf(split="train", batch_size=32, img_size=64):
             yield batch
 
 
+class PrefetchGenerator:
+    """Prefetch batches in a background thread to overlap data loading with GPU compute."""
+    def __init__(self, generator, buffer_size=4):
+        self.generator = generator
+        self.buffer_size = buffer_size
+        self.queue = queue.Queue(maxsize=buffer_size)
+        self.thread = threading.Thread(target=self._prefetch_loop, daemon=True)
+        self.thread.start()
+
+    def _prefetch_loop(self):
+        """Background thread that fills the prefetch queue."""
+        try:
+            for item in self.generator:
+                self.queue.put(item)
+        except StopIteration:
+            pass
+        # Signal end with None
+        for _ in range(self.buffer_size):
+            self.queue.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is None:
+            raise StopIteration
+        return item
+
+
 # ==========================================
 # 10. Training
 # ==========================================
@@ -519,13 +551,16 @@ def main():
     print(f"      Platform: {jax.default_backend()}", flush=True)
     mesh = Mesh(devices, ["devices"])
 
-    # Setup data
-    print("\n[1/5] Setting up data loader...", flush=True)
+    # Setup data with prefetching
+    print("\n[1/5] Setting up data loader with prefetching...", flush=True)
     train_gen = celeba_generator_hf(
         split="train",
         batch_size=CONFIG['batch_size'],
         img_size=CONFIG['img_size']
     )
+    # Wrap with prefetch generator to overlap data loading with GPU compute
+    train_gen = PrefetchGenerator(train_gen, buffer_size=4)
+    print(f"    Prefetch buffer: 4 batches", flush=True)
 
     data_sharding = NamedSharding(mesh, PartitionSpec("devices"))
 
