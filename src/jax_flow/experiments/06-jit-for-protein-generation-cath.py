@@ -1,4 +1,5 @@
 import sys
+import json
 import os
 
 import jax
@@ -11,7 +12,7 @@ import numpy as np
 import math
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from datasets.cath import download_cath_dataset, cath_generator
+from datasets.cath import download_cath_dataset, cath_generator, process_chain
 
 # ==========================================
 # 1. Configuration
@@ -223,45 +224,57 @@ def create_train_state(rng, config):
 
 @jax.jit
 def train_step(state, batch, rng):
-    """
-    Stable Flow Matching Step:
-    Predict 'x' and minimize MSE(x_pred, x_clean).
-    This avoids the 1/(1-t) singularity.
-    """
     x_clean = batch
-    B = x_clean.shape[0]
+    B, N, _, _ = x_clean.shape
     
     rng, t_rng, n_rng = jax.random.split(rng, 3)
-    
-    # 1. Sample Time t ~ Uniform[0, 1]
     t = jax.random.uniform(t_rng, (B, 1))
-    
-    # 2. Sample Noise x0 ~ Normal(0, 1)
     x_noise = jax.random.normal(n_rng, x_clean.shape)
     
-    # 3. Interpolate
+    # Interpolate
     t_bc = t.reshape((B, 1, 1, 1))
     x_t = (1 - t_bc) * x_noise + t_bc * x_clean
     
     def loss_fn(params):
-        # Model predicts Clean Image (x)
         x_pred = state.apply_fn({'params': params}, x_t, t)
+        squared_error = (x_pred - x_clean) ** 2
         
-        # STABLE LOSS: Simple MSE on the data prediction
-        # We do NOT convert to velocity here to avoid dividing by (1-t)
-        loss = jnp.mean((x_pred - x_clean) ** 2)
+        # --- BAND WEIGHTING STRATEGY ---
+        # 1. Create a coordinate grid
+        idx = jnp.arange(N)
+        i, j = jnp.meshgrid(idx, idx)
+        
+        # 2. Identify the Backbone Band (|i - j| == 1)
+        # These are the neighbors. They MUST be 3.8 Angstroms.
+        is_backbone = jnp.abs(i - j) == 1
+        
+        # 3. Identify the Diagonal (|i - j| == 0)
+        is_diag = jnp.abs(i - j) == 0
+        
+        # 4. Create Weight Map
+        # Base weight = 1.0
+        weights = jnp.ones((N, N))
+        
+        # Diagonal weight = 0.0 (Ignore it, we know it's 0)
+        weights = jnp.where(is_diag, 0.0, weights)
+        
+        # Backbone weight = 10.0 (CRITICAL: Force the model to learn 3.8A)
+        weights = jnp.where(is_backbone, 10.0, weights)
+        
+        # Broadcast to batch [B, N, N, 1]
+        weights = jnp.expand_dims(weights, (0, 3))
+        
+        # Apply Weighted Loss
+        loss = jnp.sum(squared_error * weights) / jnp.sum(weights * B)
+        
         return loss
 
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grads = grad_fn(state.params)
-    
-    # Optional: Gradient Clipping (Adds extra stability)
     grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
-    
     state = state.apply_gradients(grads=grads)
     
     return state, loss, rng
-
 
 # ==========================================
 # 6. Inference (Sampling)
@@ -336,29 +349,31 @@ def reconstruct_and_check_physics_jax(dist_map_pred):
     Input: dist_map_pred (JAX Array, Shape: [N, N], Unit: Angstroms)
     Returns: Average bond length deviation
     """
-    # 1. Symmetrize (Crucial: Distance maps must be symmetric)
-    # Average with transpose to remove any numerical asymmetry from generation
-    D = (dist_map_pred + dist_map_pred.T) / 2.0
-    N = D.shape[0]
+    N = dist_map_pred.shape[0]
 
-    # 2. Classical MDS: Convert Distance Matrix -> 3D Coordinates
-    # Formula: B = -0.5 * J * D^2 * J
-    # J is the "Centering Matrix": I - 1/N * Ones
+    # --- THE FIX: FORCE DIAGONAL TO ZERO ---
+    # Create an index matrix for the diagonal (0,0), (1,1)...
+    idx = jnp.arange(N)
+    # Use .at[].set() because JAX arrays are immutable
+    dist_map_pred = dist_map_pred.at[idx, idx].set(0.0)
     
-    # Create Centering Matrix J
+    # 1. Symmetrize (Crucial for MDS stability)
+    D = (dist_map_pred + dist_map_pred.T) / 2.0
+
+    # 2. Classical MDS: Distance Matrix -> 3D Coordinates
+    # Centering Matrix J = I - 1/N * Ones
     J = jnp.eye(N) - jnp.ones((N, N)) / N
     
-    # Apply Double Centering
-    # Note: We square D because MDS works on squared distances
+    # Double Centering: B = -0.5 * J * D^2 * J
     B = -0.5 * J @ (D**2) @ J
     
     # 3. Eigendecomposition
-    # eigh is for Hermitian/Symmetric matrices (faster/stable)
+    # eigh is for symmetric matrices (faster/stable)
     eigvals, eigvecs = jnp.linalg.eigh(B)
     
-    # 4. Extract Top 3 Coordinates (X, Y, Z)
-    # eigh returns eigenvalues in ascending order. We want the LAST 3 (largest).
-    # We clip eigenvalues to be non-negative to avoid NaNs from small numerical noise
+    # 4. Extract Top 3 Coordinates
+    # Sort descending (largest eigenvalues first)
+    # JAX eigh returns ascending, so take the last 3
     top_vals = jnp.clip(eigvals[-3:], a_min=0.0)
     top_vecs = eigvecs[:, -3:]
     
@@ -368,41 +383,77 @@ def reconstruct_and_check_physics_jax(dist_map_pred):
     
     # --- PHYSICS CHECK ---
 
-    # 5. Calculate Bond Lengths
-    # Distance between residue i and i+1
-    # diffs = coords[i+1] - coords[i]
+    # 5. Calculate Bond Lengths (Distance between i and i+1)
     diffs = coords[1:] - coords[:-1]
-    
-    # Euclidean norm of these vectors
     bond_lengths = jnp.linalg.norm(diffs, axis=1)
     
-    # 6. Statistics (Move to CPU for printing/plotting)
+    # 6. Statistics (Convert to float for printing)
     avg_bond = float(bond_lengths.mean())
     std_bond = float(bond_lengths.std())
     
     print(f"Reconstructed Bond Length: {avg_bond:.3f} Å +/- {std_bond:.3f}")
     
     # 7. Visualization
-    # Histogram of bond lengths
-    #plt.figure(figsize=(6, 4))
+    #plt.figure(figsize=(10, 4))
+    
+    # Subplot 1: Histogram
+    #plt.subplot(1, 2, 1)
     #plt.hist(np.array(bond_lengths), bins=30, color='skyblue', edgecolor='black')
     #plt.axvline(x=3.8, color='red', linestyle='--', label='Target (3.8 Å)')
-    #plt.title("Distribution of Backbone Bond Lengths")
-    #plt.xlabel("Bond Length (Angstroms)")
-    #plt.ylabel("Count")
+    #plt.title(f"Bond Lengths (Avg: {avg_bond:.2f})")
     #plt.legend()
-    #plt.show()
     
-    # Optional: Scatter plot of the 3D backbone
-    # Just to see if it looks like a protein or a hairball
-    #fig = plt.figure(figsize=(6, 6))
-    #ax = fig.add_subplot(111, projection='3d')
-    #c = np.array(coords)
-    #ax.plot(c[:, 0], c[:, 1], c[:, 2], '-o', markersize=2, alpha=0.7)
-    #ax.set_title("Reconstructed 3D Backbone")
-    #plt.show()
+    # Subplot 2: The Distance Map itself (Zoomed in)
+    #plt.subplot(1, 2, 2)
+    # Show just the first 30x30 to see the diagonal texture clearly
+    #zoom_n = min(30, N)
+    #plt.imshow(np.array(dist_map_pred[:zoom_n, :zoom_n]), cmap='viridis_r', vmin=0, vmax=12.0)
+    #plt.colorbar(label="Angstroms")
+    #plt.title(f"Zoomed Map (0-{zoom_n})")
+   # 
+   # plt.tight_layout()
+   # plt.show()
     
     return avg_bond
+
+
+def single_protein_generator(jsonl_path, batch_size, img_size):
+    valid_map = None
+    
+    print("Searching for a valid target protein...")
+    with open(jsonl_path, 'r') as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                # 1. Check length
+                if len(entry['coords']['CA']) < 40: 
+                    continue
+                    
+                # 2. Try processing it
+                candidate_map = process_chain(entry, img_size=img_size)
+                
+                # 3. CRITICAL CHECK: ensure it's not None
+                if candidate_map is not None:
+                    valid_map = candidate_map
+                    print(f"Found target! Shape: {valid_map.shape}")
+                    break
+            except:
+                continue
+    
+    if valid_map is None:
+        raise ValueError("Could not find ANY valid proteins in the dataset file!")
+
+    # 4. Create the batch (Ensure float32)
+    # Add channel dim: (128, 128) -> (128, 128, 1)
+    if valid_map.ndim == 2:
+        valid_map = valid_map[:, :, None]
+        
+    batch = np.array([valid_map] * batch_size, dtype=np.float32)
+    
+    print(f"Batch created. Dtype: {batch.dtype}") # Should be float32, NOT object
+    
+    while True:
+        yield batch
 
 # ==========================================
 # 5. Main Loop
@@ -431,6 +482,8 @@ def main():
     train_gen = cath_generator(DATA_PATH, 
                                batch_size=CONFIG['batch_size'], 
                                img_size=CONFIG['img_size'])
+    
+    train_gen = single_protein_generator(DATA_PATH, batch_size=CONFIG['batch_size'], img_size=CONFIG['img_size'])
 
     # 2. Setup Training
     rng = jax.random.PRNGKey(CONFIG['seed'])
