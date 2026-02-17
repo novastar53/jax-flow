@@ -183,10 +183,10 @@ class DenoisingTransformer(nnx.Module):
         )
 
         # Transformer blocks
-        self.blocks = [
+        self.blocks = nnx.List([
             TransformerBlock(cfg, self.rope_omega, rngs)
             for _ in range(config['depth'])
-        ]
+        ])
 
         # Output head
         self.ln_f = nnx.RMSNorm(
