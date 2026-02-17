@@ -7,6 +7,7 @@ Uses flax.nnx and optimized attention (cuDNN where available).
 import sys
 import os
 import json
+from datetime import datetime
 
 # Force unbuffered output for real-time logging
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1, encoding='utf-8', errors='replace')
@@ -360,37 +361,77 @@ def create_model_and_optimizer(rng_key, config, mesh):
     return model, optimizer
 
 
-def download_checkpoint_from_hf(repo_id: str, local_dir: str) -> bool:
-    """Download checkpoint from HuggingFace Hub if available."""
+def download_checkpoint_from_hf(repo_id: str, local_dir: str) -> str | None:
+    """Download latest checkpoint from HuggingFace Hub if available.
+
+    Returns:
+        Path to downloaded checkpoint dir, or None if not found.
+    """
     try:
         print(f"Checking for checkpoint at {repo_id}...", flush=True)
+
+        # List all checkpoints in the repo
+        from huggingface_hub import list_repo_files
+        files = list(list_repo_files(repo_id, repo_type="model"))
+
+        # Find checkpoint directories
+        checkpoint_dirs = set()
+        for f in files:
+            if f.startswith("checkpoint_e"):
+                dir_name = f.split("/")[0]
+                checkpoint_dirs.add(dir_name)
+
+        if not checkpoint_dirs:
+            print("No checkpoints found in HuggingFace repo", flush=True)
+            return None
+
+        # Get latest checkpoint (sorted by name which includes timestamp)
+        latest_checkpoint = sorted(checkpoint_dirs)[-1]
+        print(f"Found latest checkpoint: {latest_checkpoint}", flush=True)
+
+        # Download just that checkpoint
+        checkpoint_local_dir = os.path.join(local_dir, latest_checkpoint)
+        os.makedirs(checkpoint_local_dir, exist_ok=True)
+
         snapshot_download(
             repo_id=repo_id,
             repo_type="model",
-            local_dir=local_dir,
-            allow_patterns=["*.nnx", "*.json"],
+            local_dir=checkpoint_local_dir,
+            allow_patterns=[f"{latest_checkpoint}/*"],
         )
-        # Check if we actually got the checkpoint
-        checkpoint_path = os.path.join(local_dir, "model_state.nnx")
-        if os.path.exists(checkpoint_path):
-            print(f"Downloaded checkpoint from HuggingFace", flush=True)
-            return True
-        return False
+
+        # Return the actual checkpoint directory (not the parent)
+        return checkpoint_local_dir
     except Exception as e:
         print(f"Could not download from HuggingFace: {e}", flush=True)
-        return False
+        return None
 
 
 def load_model_from_checkpoint(checkpoint_dir, config, mesh):
-    """Load model from checkpoint if it exists."""
+    """Load model from latest checkpoint if it exists."""
     checkpoint_dir = os.path.abspath(checkpoint_dir)
-    checkpoint_path = os.path.join(checkpoint_dir, "model_state")
-    config_path = os.path.join(checkpoint_dir, "config.json")
+
+    # Find all checkpoint subdirectories
+    if not os.path.exists(checkpoint_dir):
+        return None, None
+
+    checkpoint_subdirs = [
+        d for d in os.listdir(checkpoint_dir)
+        if d.startswith("checkpoint_e") and os.path.isdir(os.path.join(checkpoint_dir, d))
+    ]
+
+    if not checkpoint_subdirs:
+        return None, None
+
+    # Get latest checkpoint (sorted by name which includes timestamp)
+    latest_checkpoint = sorted(checkpoint_subdirs)[-1]
+    actual_checkpoint_dir = os.path.join(checkpoint_dir, latest_checkpoint)
+    checkpoint_path = os.path.join(actual_checkpoint_dir, "model_state")
 
     if not os.path.exists(checkpoint_path):
         return None, None
 
-    print(f"Loading checkpoint from {checkpoint_dir}...", flush=True)
+    print(f"Loading checkpoint from {actual_checkpoint_dir}...", flush=True)
 
     with mesh:
         rngs = nnx.Rngs(jax.random.PRNGKey(config['seed']))
@@ -518,7 +559,8 @@ def main():
     # If no local checkpoint, try downloading from HuggingFace
     if model is None:
         print("No local checkpoint found. Checking HuggingFace Hub...", flush=True)
-        if download_checkpoint_from_hf(hf_repo_id, checkpoint_dir):
+        downloaded_checkpoint_path = download_checkpoint_from_hf(hf_repo_id, checkpoint_dir)
+        if downloaded_checkpoint_path:
             model, optimizer = load_model_from_checkpoint(checkpoint_dir, CONFIG, mesh)
 
     if model is None:
@@ -546,30 +588,45 @@ def main():
     hf_repo_id = "vikramp/jax_jit"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    def save_checkpoint(model, optimizer, epoch):
+    def save_checkpoint(model, optimizer, epoch, step):
         """Save model checkpoint locally and upload to HuggingFace."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_name = f"checkpoint_e{epoch:02d}_{timestamp}"
+        current_checkpoint_dir = os.path.join(checkpoint_dir, checkpoint_name)
+        os.makedirs(current_checkpoint_dir, exist_ok=True)
+
         print(f"\nSaving checkpoint at epoch {epoch}...", flush=True)
 
         # Save model state using orbax
         graphdef, state = nnx.split(model)
-        checkpoint_path = os.path.join(checkpoint_dir, "model_state")
+        checkpoint_path = os.path.join(current_checkpoint_dir, "model_state")
         cp = ocp.StandardCheckpointer()
         cp.save(checkpoint_path, state)
         cp.wait_until_finished()
 
         # Save config
-        with open(os.path.join(checkpoint_dir, "config.json"), "w") as f:
+        with open(os.path.join(current_checkpoint_dir, "config.json"), "w") as f:
             json.dump(CONFIG, f, indent=2)
 
-        print(f"Checkpoint saved to {checkpoint_dir}/", flush=True)
+        # Save metadata
+        metadata = {
+            "epoch": epoch,
+            "timestamp": timestamp,
+            "global_step": step,
+        }
+        with open(os.path.join(current_checkpoint_dir, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"Checkpoint saved to {current_checkpoint_dir}/", flush=True)
 
         # Upload to Hugging Face
         print(f"Uploading checkpoint to Hugging Face...", flush=True)
         try:
             upload_folder(
-                folder_path=checkpoint_dir,
+                folder_path=current_checkpoint_dir,
                 repo_id=hf_repo_id,
-                repo_type="model"
+                repo_type="model",
+                path_in_repo=checkpoint_name
             )
             print(f"Successfully uploaded to Hugging Face!", flush=True)
         except Exception as e:
@@ -588,7 +645,7 @@ def main():
         global_step = 0
 
         # Save initial checkpoint (epoch 0)
-        save_checkpoint(model, optimizer, 0)
+        save_checkpoint(model, optimizer, 0, 0)
 
         for epoch in range(num_epochs):
             print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===", flush=True)
@@ -631,7 +688,7 @@ def main():
 
             # Save checkpoint every N epochs (using modulus)
             if (epoch + 1) % checkpoint_every_epochs == 0:
-                save_checkpoint(model, optimizer, epoch + 1)
+                save_checkpoint(model, optimizer, epoch + 1, global_step)
 
     print("\n" + "="*60, flush=True)
     print("Training complete!", flush=True)
