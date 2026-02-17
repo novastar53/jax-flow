@@ -737,28 +737,19 @@ def sample(model, rng, img_size, steps=50, noise_scale=1.0, t_eps=1e-3, batch_si
     print(f"Sampling with {steps} steps...", flush=True)
 
     x_current = jax.random.normal(rng, (batch_size, img_size, img_size, 3)) * noise_scale
-    # Use linspace like the reference: [0.0, 1.0] with steps+1
-    t_values = np.linspace(0.0, 1.0, steps + 1)
+    # Use linspace from 0 to 0.99 (don't go all the way to 1.0 to avoid instability)
+    t_values = np.linspace(0.0, 0.99, steps)
+    dt = t_values[1] - t_values[0]
 
-    for i in range(steps - 1):
-        t = t_values[i]
-        t_next = t_values[i + 1]
-        t_vec = jnp.ones((batch_size, 1)) * t
-
+    for t_scalar in t_values[:-1]:
+        t_vec = jnp.ones((batch_size, 1)) * t_scalar
+        # Model predicts the clean image x_1 from the current noised state
         x_clean_pred = model(x_current, t_vec)
-        # Use clamp_min like the reference
-        denom = jnp.maximum(1.0 - t, t_eps)
+        # Compute velocity: v = (x_1 - x_t) / (1 - t)
+        denom = 1.0 - t_scalar
         v = (x_clean_pred - x_current) / denom
-        x_current = x_current + (t_next - t) * v
-
-    # Last step
-    t = t_values[-2]
-    t_next = t_values[-1]
-    t_vec = jnp.ones((batch_size, 1)) * t
-    x_clean_pred = model(x_current, t_vec)
-    denom = jnp.maximum(1.0 - t, t_eps)
-    v = (x_clean_pred - x_current) / denom
-    x_current = x_current + (t_next - t) * v
+        # Euler step
+        x_current = x_current + v * dt
 
     return x_current
 
