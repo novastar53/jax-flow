@@ -543,10 +543,11 @@ def main():
     # Checkpoint config
     checkpoint_dir = os.path.abspath("model_checkpoint")
     checkpoint_every_epochs = 1  # Save every N epochs (also saves at start and end)
+    hf_repo_id = "vikramp/jax_jit"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     def save_checkpoint(model, optimizer, epoch):
-        """Save model checkpoint."""
+        """Save model checkpoint locally and upload to HuggingFace."""
         print(f"\nSaving checkpoint at epoch {epoch}...", flush=True)
 
         # Save model state using orbax
@@ -561,6 +562,18 @@ def main():
             json.dump(CONFIG, f, indent=2)
 
         print(f"Checkpoint saved to {checkpoint_dir}/", flush=True)
+
+        # Upload to Hugging Face
+        print(f"Uploading checkpoint to Hugging Face...", flush=True)
+        try:
+            upload_folder(
+                folder_path=checkpoint_dir,
+                repo_id=hf_repo_id,
+                repo_type="model"
+            )
+            print(f"Successfully uploaded to Hugging Face!", flush=True)
+        except Exception as e:
+            print(f"Failed to upload to Hugging Face: {e}", flush=True)
 
     print(f"[4/5] Training configuration:", flush=True)
     print(f"      Steps per epoch: {steps_per_epoch}", flush=True)
@@ -623,19 +636,6 @@ def main():
     print("\n" + "="*60, flush=True)
     print("Training complete!", flush=True)
     print("="*60, flush=True)
-
-    # Upload to Hugging Face
-    print("\nUploading to Hugging Face...", flush=True)
-    try:
-        login()
-        upload_folder(
-            folder_path=checkpoint_dir,
-            repo_id="vikramp/jax_jit",
-            repo_type="model"
-        )
-        print("Successfully uploaded to Hugging Face!", flush=True)
-    except Exception as e:
-        print(f"Failed to upload to Hugging Face: {e}", flush=True)
 
 if __name__ == "__main__":
     main()
