@@ -704,19 +704,19 @@ def get_lr(step, total_steps, config):
 
 
 @nnx.jit
-def train_step(model, optimizer, batch, rng, config):
-    """JiT-style training step with v-loss (matching reference)."""
+def _train_step_jit(model, optimizer, batch, rng, P_mean, P_std, noise_scale, t_eps):
+    """JIT-compiled training step with numeric arguments only."""
     x_clean = batch  # [B, H, W, C]
     B = x_clean.shape[0]
 
     rng, t_rng, n_rng = jax.random.split(rng, 3)
 
     # Sample t from logit-normal
-    z = jax.random.normal(t_rng, (B, 1)) * config['P_std'] + config['P_mean']
+    z = jax.random.normal(t_rng, (B, 1)) * P_std + P_mean
     t = jax.nn.sigmoid(z)
 
     # Noise
-    noise = jax.random.normal(n_rng, x_clean.shape) * config['noise_scale']
+    noise = jax.random.normal(n_rng, x_clean.shape) * noise_scale
 
     # Interpolate: z = t * x + (1 - t) * e
     t_img = t.reshape(B, 1, 1, 1)
@@ -724,7 +724,7 @@ def train_step(model, optimizer, batch, rng, config):
 
     # Target velocity: v = (x - z) / (1 - t)
     # Use clamp_min like the reference: (1 - t).clamp_min(eps)
-    denom = jnp.clip(1 - t_img, config['t_eps'], 1.0)
+    denom = jnp.clip(1 - t_img, t_eps, 1.0)
     v_target = (x_clean - x_t) / denom
 
     def loss_fn(m):
@@ -742,11 +742,22 @@ def train_step(model, optimizer, batch, rng, config):
     return loss, rng
 
 
-def sample(model, rng, img_size, steps=50, config=None, batch_size=1):
+def train_step(model, optimizer, batch, rng, config):
+    """JiT-style training step with v-loss (matching reference).
+
+    Wrapper that extracts numeric values from config before JIT.
+    """
+    return _train_step_jit(
+        model, optimizer, batch, rng,
+        config['P_mean'], config['P_std'], config['noise_scale'], config['t_eps']
+    )
+
+
+def sample(model, rng, img_size, steps=50, noise_scale=1.0, t_eps=1e-3, batch_size=1):
     """Generate samples using Euler method (matching JiT reference)."""
     print(f"Sampling with {steps} steps...", flush=True)
 
-    x_current = jax.random.normal(rng, (batch_size, img_size, img_size, 3)) * config['noise_scale']
+    x_current = jax.random.normal(rng, (batch_size, img_size, img_size, 3)) * noise_scale
     # Use linspace like the reference: [0.0, 1.0] with steps+1
     t_values = np.linspace(0.0, 1.0, steps + 1)
 
@@ -757,7 +768,7 @@ def sample(model, rng, img_size, steps=50, config=None, batch_size=1):
 
         x_clean_pred = model(x_current, t_vec)
         # Use clamp_min like the reference
-        denom = jnp.maximum(1.0 - t, config['t_eps'])
+        denom = jnp.maximum(1.0 - t, t_eps)
         v = (x_clean_pred - x_current) / denom
         x_current = x_current + (t_next - t) * v
 
@@ -766,7 +777,7 @@ def sample(model, rng, img_size, steps=50, config=None, batch_size=1):
     t_next = t_values[-1]
     t_vec = jnp.ones((batch_size, 1)) * t
     x_clean_pred = model(x_current, t_vec)
-    denom = jnp.maximum(1.0 - t, config['t_eps'])
+    denom = jnp.maximum(1.0 - t, t_eps)
     v = (x_clean_pred - x_current) / denom
     x_current = x_current + (t_next - t) * v
 
@@ -866,7 +877,8 @@ def main():
                     print(f"Sampling at step {global_step}...", flush=True)
                     # Use EMA model for sampling
                     ema_model = ema_tracker.apply_to_model(model)
-                    sample_out = sample(ema_model, rng, img_size=CONFIG['img_size'], config=CONFIG)
+                    sample_out = sample(ema_model, rng, img_size=CONFIG['img_size'],
+                                        noise_scale=CONFIG['noise_scale'], t_eps=CONFIG['t_eps'])
 
                     img = np.array(sample_out[0])
                     img = (img + 1.0) / 2.0
