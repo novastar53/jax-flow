@@ -696,9 +696,8 @@ def get_lr(step, total_steps, config):
             return config['lr']
 
 
-@nnx.jit
-def _train_step_jit(model, optimizer, batch, rng, P_mean, P_std, noise_scale, t_eps):
-    """JIT-compiled training step with numeric arguments only."""
+def train_step_fn(model, batch, rng, P_mean, P_std, noise_scale, t_eps):
+    """Training step logic (not JIT'd - JIT applied in trainer loop)."""
     x_clean = batch  # [B, H, W, C]
     B = x_clean.shape[0]
 
@@ -716,34 +715,21 @@ def _train_step_jit(model, optimizer, batch, rng, P_mean, P_std, noise_scale, t_
     x_t = t_img * x_clean + (1 - t_img) * noise
 
     # Target velocity: v = (x - z) / (1 - t)
-    # Use clamp_min like the reference: (1 - t).clamp_min(eps)
     denom = jnp.clip(1 - t_img, t_eps, 1.0)
     v_target = (x_clean - x_t) / denom
 
     def loss_fn(m):
         x_pred = m(x_t, t)
-        # v_pred = (x_pred - z) / (1 - t)
         v_pred = (x_pred - x_t) / denom
-
-        # L2 loss: mean over all spatial dims, then mean over batch
         loss = jnp.mean((v_pred - v_target) ** 2)
         return loss
 
     loss, grads = nnx.value_and_grad(loss_fn)(model)
-    optimizer.update(model, grads)
-
-    return loss, rng
+    return loss, grads, rng
 
 
-def train_step(model, optimizer, batch, rng, config):
-    """JiT-style training step with v-loss (matching reference).
-
-    Wrapper that extracts numeric values from config before JIT.
-    """
-    return _train_step_jit(
-        model, optimizer, batch, rng,
-        config['P_mean'], config['P_std'], config['noise_scale'], config['t_eps']
-    )
+# JIT the function outside like in jaxpt trainers
+# Will be used in the training loop
 
 
 def sample(model, rng, img_size, steps=50, noise_scale=1.0, t_eps=1e-3, batch_size=1):
@@ -842,6 +828,9 @@ def main():
     with mesh:
         global_step = 0
 
+        # JIT the train step inside mesh context like jaxpt does
+        train_step_jit = nnx.jit(train_step_fn)
+
         # Debug first batch
         first_batch = next(train_gen)
         print(f"\nDebug - First batch: shape={first_batch.shape}, "
@@ -855,7 +844,11 @@ def main():
                 batch = next(train_gen)
                 batch = jax.device_put(batch, data_sharding)
 
-                loss, rng = train_step(model, optimizer, batch, rng, CONFIG)
+                loss, grads, rng = train_step_jit(
+                    model, batch, rng,
+                    CONFIG['P_mean'], CONFIG['P_std'], CONFIG['noise_scale'], CONFIG['t_eps']
+                )
+                optimizer.update(model, grads)
                 epoch_losses.append(float(loss))
 
                 # Update EMA after each training step
