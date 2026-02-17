@@ -630,18 +630,11 @@ def create_model_and_optimizer(rng_key, config, mesh, total_steps: int = 10000):
             end_value=config['min_lr'],
         )
 
-        # Weight decay mask: only apply to weights (2D+ tensors), not biases/norms
-        # Get the parameter structure and create mask
-        graphdef, params, _ = nnx.split(model, nnx.Param, nnx.Variable)
-        weight_decay_mask = jax.tree.map(
-            lambda p: len(p.shape) >= 2,  # Only decay 2D+ tensors (weights, not biases/norms)
-            params
-        )
-
+        # Use AdamW with weight decay applied to all parameters
+        # (weight decay masking would require additional complexity with nnx)
         tx = optax.adamw(
             learning_rate=schedule,
             weight_decay=config['weight_decay'],
-            mask=weight_decay_mask,
         )
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
