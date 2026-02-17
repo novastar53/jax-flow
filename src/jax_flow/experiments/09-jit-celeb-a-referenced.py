@@ -737,8 +737,9 @@ def sample(model, rng, img_size, steps=50, noise_scale=1.0, t_eps=1e-3, batch_si
     print(f"Sampling with {steps} steps...", flush=True)
 
     x_current = jax.random.normal(rng, (batch_size, img_size, img_size, 3)) * noise_scale
-    # Use linspace from 0 to 0.99 (don't go all the way to 1.0 to avoid instability)
-    t_values = np.linspace(0.0, 0.99, steps)
+    # Use linspace from 0 to 0.99 with steps+1 points (don't go all the way to 1.0 to avoid instability)
+    # This gives us 'steps' intervals to iterate through
+    t_values = np.linspace(0.0, 0.99, steps + 1)
     dt = t_values[1] - t_values[0]
 
     for t_scalar in t_values[:-1]:
