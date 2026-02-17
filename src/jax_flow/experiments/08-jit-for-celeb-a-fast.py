@@ -382,6 +382,7 @@ def download_checkpoint_from_hf(repo_id: str, local_dir: str) -> bool:
 
 def load_model_from_checkpoint(checkpoint_dir, config, mesh):
     """Load model from checkpoint if it exists."""
+    checkpoint_dir = os.path.abspath(checkpoint_dir)
     checkpoint_path = os.path.join(checkpoint_dir, "model_state")
     config_path = os.path.join(checkpoint_dir, "config.json")
 
@@ -593,7 +594,7 @@ def main():
 
     # Save model checkpoint
     print("\nSaving model checkpoint...", flush=True)
-    checkpoint_dir = "model_checkpoint"
+    checkpoint_dir = os.path.abspath("model_checkpoint")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Save model state using orbax
