@@ -273,30 +273,31 @@ def celeba_generator_hf(split="train", batch_size=32, img_size=64):
 
 def create_model_and_optimizer(rng_key, config, mesh):
     """Create model and optimizer with proper sharding."""
-    rngs = nnx.Rngs(rng_key)
-    model = DenoisingTransformer(config, rngs)
+    with mesh:
+        rngs = nnx.Rngs(rng_key)
+        model = DenoisingTransformer(config, rngs)
 
-    # Initialize with dummy data
-    dummy_x = jnp.ones((1, config['img_size'], config['img_size'], config['channels']))
-    dummy_t = jnp.ones((1, 1))
+        # Initialize with dummy data
+        dummy_x = jnp.ones((1, config['img_size'], config['img_size'], config['channels']))
+        dummy_t = jnp.ones((1, 1))
 
-    # Run once to initialize
-    _ = model(dummy_x, dummy_t)
+        # Run once to initialize
+        _ = model(dummy_x, dummy_t)
 
-    # Create optimizer with weight decay mask (exclude biases and norms)
-    graphdef, params, _ = nnx.split(model, nnx.Param, nnx.Variable)
-    weight_decay_mask = jax.tree.map(
-        lambda x: len(x.value.shape) > 1,
-        params,
-        is_leaf=lambda n: isinstance(n, nnx.Param),
-    )
+        # Create optimizer with weight decay mask (exclude biases and norms)
+        graphdef, params, _ = nnx.split(model, nnx.Param, nnx.Variable)
+        weight_decay_mask = jax.tree.map(
+            lambda x: len(x.value.shape) > 1,
+            params,
+            is_leaf=lambda n: isinstance(n, nnx.Param),
+        )
 
-    tx = optax.adamw(
-        learning_rate=config['lr'],
-        weight_decay=0.1,
-        mask=weight_decay_mask,
-    )
-    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+        tx = optax.adamw(
+            learning_rate=config['lr'],
+            weight_decay=0.1,
+            mask=weight_decay_mask,
+        )
+        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     return model, optimizer
 
@@ -383,8 +384,7 @@ def main():
     rng = jax.random.PRNGKey(CONFIG['seed'])
     rng, init_rng = jax.random.split(rng)
 
-    with mesh:
-        model, optimizer = create_model_and_optimizer(init_rng, CONFIG, mesh)
+    model, optimizer = create_model_and_optimizer(init_rng, CONFIG, mesh)
 
     print(f"    Model initialized: {CONFIG['dim_model']}d, {CONFIG['depth']} layers", flush=True)
     print(f"    Using cuDNN attention: {jax.devices()[0].platform == 'gpu'}", flush=True)
