@@ -358,6 +358,49 @@ def create_model_and_optimizer(rng_key, config, mesh):
     return model, optimizer
 
 
+def load_model_from_checkpoint(checkpoint_dir, config, mesh):
+    """Load model from checkpoint if it exists."""
+    checkpoint_path = os.path.join(checkpoint_dir, "model_state.nnx")
+    config_path = os.path.join(checkpoint_dir, "config.json")
+
+    if not os.path.exists(checkpoint_path):
+        return None, None
+
+    print(f"Loading checkpoint from {checkpoint_dir}...", flush=True)
+
+    with mesh:
+        rngs = nnx.Rngs(jax.random.PRNGKey(config['seed']))
+        model = DenoisingTransformer(config, rngs)
+
+        # Initialize with dummy data
+        dummy_x = jnp.ones((1, config['img_size'], config['img_size'], config['channels']))
+        dummy_t = jnp.ones((1, 1))
+        _ = model(dummy_x, dummy_t)
+
+        # Load checkpoint state
+        graphdef, state = nnx.split(model)
+        state = nnx.state.load_checkpoint(checkpoint_path)
+        model = nnx.merge(graphdef, state)
+
+        # Create optimizer
+        graphdef, params, _ = nnx.split(model, nnx.Param, nnx.Variable)
+        weight_decay_mask = jax.tree.map(
+            lambda x: len(x.value.shape) > 1,
+            params,
+            is_leaf=lambda n: isinstance(n, nnx.Param),
+        )
+
+        tx = optax.adamw(
+            learning_rate=config['lr'],
+            weight_decay=0.1,
+            mask=weight_decay_mask,
+        )
+        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+    print("Checkpoint loaded successfully!", flush=True)
+    return model, optimizer
+
+
 @nnx.jit
 def train_step(model, optimizer, batch, rng):
     """Single training step with v-loss."""
@@ -440,9 +483,17 @@ def main():
     rng = jax.random.PRNGKey(CONFIG['seed'])
     rng, init_rng = jax.random.split(rng)
 
-    model, optimizer = create_model_and_optimizer(init_rng, CONFIG, mesh)
+    # Check for existing checkpoint
+    checkpoint_dir = "model_checkpoint"
+    model, optimizer = load_model_from_checkpoint(checkpoint_dir, CONFIG, mesh)
 
-    print(f"    Model initialized: {CONFIG['dim_model']}d, {CONFIG['depth']} layers", flush=True)
+    if model is None:
+        print("No checkpoint found. Creating new model...", flush=True)
+        model, optimizer = create_model_and_optimizer(init_rng, CONFIG, mesh)
+        print(f"    Model initialized: {CONFIG['dim_model']}d, {CONFIG['depth']} layers", flush=True)
+    else:
+        print(f"    Model loaded: {CONFIG['dim_model']}d, {CONFIG['depth']} layers", flush=True)
+
     print(f"    Using cuDNN attention: {jax.devices()[0].platform == 'gpu'}", flush=True)
 
     # Setup output
