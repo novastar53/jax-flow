@@ -28,9 +28,88 @@ from PIL import Image
 # Add jaxpt to path
 sys.path.insert(0, os.path.expanduser("~/dev/jaxpt/src"))
 from jaxpt.modules.config import Config
-from jaxpt.modules.attention import CausalSelfAttention_w_RoPE, _calc_attention
+from jaxpt.modules.attention import _calc_slow_attn
 from jaxpt.modules.mlp import GLU
-from jaxpt.modules.position import calc_rope_omega_llama
+from jaxpt.modules.position import calc_rope_omega_llama, RoPE_Llama
+
+# ==========================================
+# Non-Causal Self-Attention for Images
+# ==========================================
+
+def _calc_attention_non_causal(
+    query,
+    key,
+    value,
+    mask=None,
+    bias=None,
+    implementation: str | None = None,
+):
+    """Non-causal attention for bidirectional image denoising."""
+    output_shape = jnp.asarray(query).shape
+
+    match implementation:
+        case "xla" | "cudnn":
+            # Non-causal: is_causal=False allows full bidirectional attention
+            out = jax.nn.dot_product_attention(
+                query,
+                key,
+                value,
+                mask=mask,
+                bias=bias,
+                is_causal=False,  # KEY DIFFERENCE: No causal masking
+                implementation=implementation,
+            )
+        case _:
+            out, _ = _calc_slow_attn(query, key, value, mask, bias)
+
+    return jnp.reshape(out, output_shape)
+
+
+class SelfAttention_w_RoPE(nnx.Module, RoPE_Llama):
+    """Non-causal self-attention with RoPE for image denoising."""
+
+    def __init__(self, config, rope_omega: nnx.Variable, rngs: nnx.Rngs):
+        RoPE_Llama.__init__(self, omega=rope_omega)
+
+        self.c_attn = nnx.Linear(
+            config.n_embed,
+            3 * config.n_embed,
+            use_bias=config.attention_bias,
+            dtype=config.dtype,
+            param_dtype=config.param_dtype,
+            rngs=rngs,
+        )
+        self.c_proj = nnx.Linear(
+            config.n_embed,
+            config.n_embed,
+            use_bias=config.attention_bias,
+            dtype=config.dtype,
+            param_dtype=config.param_dtype,
+            rngs=rngs,
+        )
+        self.n_head = config.n_head
+        self.implementation = config.sdpa_implementation
+
+    def __call__(self, x, mask=None):
+        B, T, C = x.shape
+        qkv = self.c_attn(x)  # B, T, 3 * C
+        q, k, v = jnp.split(qkv, 3, axis=-1)  # 3 * (B, T, C)
+
+        q = jnp.reshape(q, (B, T, self.n_head, C // self.n_head))
+        k = jnp.reshape(k, (B, T, self.n_head, C // self.n_head))
+        v = jnp.reshape(v, (B, T, self.n_head, C // self.n_head))
+
+        # Apply RoPE to q and k
+        q = self.apply_rope(q)
+        k = self.apply_rope(k)
+
+        # Non-causal attention
+        y = _calc_attention_non_causal(q, k, v, mask=mask, implementation=self.implementation)
+
+        y = jnp.reshape(y, (B, T, C))
+        y = self.c_proj(y)
+        return y
+
 
 # ==========================================
 # 1. Configuration
@@ -129,7 +208,7 @@ class TransformerBlock(nnx.Module):
     def __init__(self, config: DenoiseConfig, rope_omega: nnx.Variable, rngs: nnx.Rngs):
         # Use simple initializers - sharding handled by mesh context
         self.ln1 = nnx.RMSNorm(config.n_embed, epsilon=config.ln_epsilon, rngs=rngs)
-        self.attn = CausalSelfAttention_w_RoPE(config, rope_omega, rngs)
+        self.attn = SelfAttention_w_RoPE(config, rope_omega, rngs)  # Non-causal for images
         self.ln2 = nnx.RMSNorm(config.n_embed, epsilon=config.ln_epsilon, rngs=rngs)
         self.mlp = GLU(config, rngs)
 
