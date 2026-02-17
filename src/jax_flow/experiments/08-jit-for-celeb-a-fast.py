@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 from datasets import load_dataset
 from PIL import Image
 from huggingface_hub import login, upload_folder, snapshot_download
+import orbax.checkpoint as ocp
 
 # Add jaxpt to path
 sys.path.insert(0, os.path.expanduser("~/dev/jaxpt/src"))
@@ -381,7 +382,7 @@ def download_checkpoint_from_hf(repo_id: str, local_dir: str) -> bool:
 
 def load_model_from_checkpoint(checkpoint_dir, config, mesh):
     """Load model from checkpoint if it exists."""
-    checkpoint_path = os.path.join(checkpoint_dir, "model_state.nnx")
+    checkpoint_path = os.path.join(checkpoint_dir, "model_state")
     config_path = os.path.join(checkpoint_dir, "config.json")
 
     if not os.path.exists(checkpoint_path):
@@ -398,9 +399,10 @@ def load_model_from_checkpoint(checkpoint_dir, config, mesh):
         dummy_t = jnp.ones((1, 1))
         _ = model(dummy_x, dummy_t)
 
-        # Load checkpoint state
+        # Load checkpoint state using orbax
         graphdef, state = nnx.split(model)
-        state = nnx.state.load_checkpoint(checkpoint_path)
+        cp = ocp.StandardCheckpointer()
+        state = cp.restore(checkpoint_path, target=state)
         model = nnx.merge(graphdef, state)
 
         # Create optimizer
@@ -594,10 +596,12 @@ def main():
     checkpoint_dir = "model_checkpoint"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Save model state
+    # Save model state using orbax
     graphdef, state = nnx.split(model)
-    checkpoint_path = os.path.join(checkpoint_dir, "model_state.nnx")
-    nnx.state.save_checkpoint(checkpoint_path, state)
+    checkpoint_path = os.path.join(checkpoint_dir, "model_state")
+    cp = ocp.StandardCheckpointer()
+    cp.save(checkpoint_path, state)
+    cp.wait_until_finished()
 
     # Save config
     import json
