@@ -72,20 +72,19 @@ class DenoiseConfig(Config):
         self.param_dtype = jnp.float32
         self.use_cache = False
 
-        # Sharding specs - all replicated (no model parallelism needed for single GPU)
-        self.glu_fc_kernel_sharding = (None,)
-        self.glu_fc_bias_sharding = (None,)
-        self.glu_gate_kernel_sharding = (None,)
-        self.glu_gate_bias_sharding = (None,)
-        self.glu_proj_kernel_sharding = (None,)
-        self.glu_proj_bias_sharding = (None,)
+        # Sharding specs - set to None to disable partitioning annotations
+        # The mesh context will handle device placement automatically
+        self.glu_fc_kernel_sharding = None
+        self.glu_fc_bias_sharding = None
+        self.glu_gate_kernel_sharding = None
+        self.glu_gate_bias_sharding = None
+        self.glu_proj_kernel_sharding = None
+        self.glu_proj_bias_sharding = None
 
-        self.attn_c_attn_kernel_sharding = (None,)
-        self.attn_c_attn_bias_sharding = (None,)
-        self.attn_c_proj_kernel_sharding = (None,)
-        self.attn_c_proj_bias_sharding = (None,)
-
-        self.rmsnorm_partition_spec = (None,)
+        self.attn_c_attn_kernel_sharding = None
+        self.attn_c_attn_bias_sharding = None
+        self.attn_c_proj_kernel_sharding = None
+        self.attn_c_proj_bias_sharding = None
 
 # ==========================================
 # 2. The Model (flax.nnx)
@@ -128,25 +127,10 @@ class LinearBottleneckPatchEmbed(nnx.Module):
 
 class TransformerBlock(nnx.Module):
     def __init__(self, config: DenoiseConfig, rope_omega: nnx.Variable, rngs: nnx.Rngs):
-        self.ln1 = nnx.RMSNorm(
-            config.n_embed,
-            epsilon=config.ln_epsilon,
-            scale_init=nnx.with_partitioning(
-                nnx.initializers.ones,
-                getattr(config, "rmsnorm_partition_spec", (None,))
-            ),
-            rngs=rngs
-        )
+        # Use simple initializers - sharding handled by mesh context
+        self.ln1 = nnx.RMSNorm(config.n_embed, epsilon=config.ln_epsilon, rngs=rngs)
         self.attn = CausalSelfAttention_w_RoPE(config, rope_omega, rngs)
-        self.ln2 = nnx.RMSNorm(
-            config.n_embed,
-            epsilon=config.ln_epsilon,
-            scale_init=nnx.with_partitioning(
-                nnx.initializers.ones,
-                getattr(config, "rmsnorm_partition_spec", (None,))
-            ),
-            rngs=rngs
-        )
+        self.ln2 = nnx.RMSNorm(config.n_embed, epsilon=config.ln_epsilon, rngs=rngs)
         self.mlp = GLU(config, rngs)
 
     def __call__(self, x):
@@ -189,15 +173,7 @@ class DenoisingTransformer(nnx.Module):
         ])
 
         # Output head
-        self.ln_f = nnx.RMSNorm(
-            config['dim_model'],
-            epsilon=cfg.ln_epsilon,
-            scale_init=nnx.with_partitioning(
-                nnx.initializers.ones,
-                getattr(cfg, "rmsnorm_partition_spec", (None,))
-            ),
-            rngs=rngs
-        )
+        self.ln_f = nnx.RMSNorm(config['dim_model'], epsilon=cfg.ln_epsilon, rngs=rngs)
         self.head = nnx.Linear(config['dim_model'], config['dim_raw'], use_bias=False, rngs=rngs)
 
     def __call__(self, x_noisy, t):
