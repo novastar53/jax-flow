@@ -163,7 +163,7 @@ class DenoisingTransformer(nnx.Module):
             n_head=config['heads'],
             block_size=(config['img_size'] // config['patch_size']) ** 2,
             rope_base_freq=cfg.rope_base_freq,
-            dtype=jnp.float32
+            dtype=cfg.dtype
         )
 
         # Transformer blocks
