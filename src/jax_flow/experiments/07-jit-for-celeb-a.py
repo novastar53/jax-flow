@@ -2,6 +2,10 @@ import sys
 import json
 import os
 
+# Force unbuffered output for real-time logging
+sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1, encoding='utf-8', errors='replace')
+sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1, encoding='utf-8', errors='replace')
+
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -10,6 +14,8 @@ import optax
 import numpy as np
 import math
 
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 from datasets import load_dataset
 from PIL import Image
@@ -230,8 +236,9 @@ def celeba_generator_hf(split="train", batch_size=32, img_size=64):
     Uses the flwrlabs/celeba dataset.
     """
     # Load CelebA from HuggingFace (streaming mode to avoid disk space issues)
-    print(f"Loading CelebA dataset from HuggingFace (split={split})...")
+    print(f"Loading CelebA dataset from HuggingFace (split={split})...", flush=True)
     ds = load_dataset("flwrlabs/celeba", split=split, streaming=True)
+    print(f"Dataset loaded successfully! Starting data stream...", flush=True)
 
     # For memory efficiency, we'll batch as we iterate
     ds_iterator = iter(ds)
@@ -274,7 +281,7 @@ def sample_protein(state, rng, img_size, steps=100):
     """
     Robust Sampler: Stops just before t=1 to avoid singularity.
     """
-    print(f"Sampling with {steps} steps...")
+    print(f"Sampling with {steps} steps...", flush=True)
     
     # 1. Start with Noise
     x_current = jax.random.normal(rng, (1, img_size, img_size, 3))
@@ -354,21 +361,27 @@ def train_step(state, batch, rng):
 
 
 def main():
+    print("=" * 60, flush=True)
+    print("Starting CelebA Flow Matching Training", flush=True)
+    print("=" * 60, flush=True)
+
     # --- 1. Setup Data ---
-    # Initialize the adapter
+    print("\n[1/4] Setting up data loader...", flush=True)
     train_gen = celeba_generator_hf(split="train",
                                 batch_size=CONFIG['batch_size'],
                                 img_size=CONFIG['img_size'])
 
     # --- 2. Setup Model ---
-    # (Re-initialize model to reset weights and adapt to new input size)
+    print("[2/4] Initializing model...", flush=True)
     rng = jax.random.PRNGKey(CONFIG['seed'])
     rng, init_rng = jax.random.split(rng)
     state = create_train_state(init_rng, CONFIG)
+    print(f"    Model initialized: {CONFIG['dim_model']}d, {CONFIG['depth']} layers", flush=True)
 
     # --- 3. Setup Output Directory ---
     output_dir = "generated_samples"
     os.makedirs(output_dir, exist_ok=True)
+    print(f"[3/4] Output directory: {output_dir}/", flush=True)
 
     # --- 4. Training Configuration ---
     # CelebA has ~162k training images
@@ -377,14 +390,17 @@ def main():
     num_epochs = 10
     sample_every = 2000
 
-    print(f"Starting CelebA Training...")
-    print(f"Steps per epoch: {steps_per_epoch}")
-    print(f"Total epochs: {num_epochs}")
-    print(f"Saving samples every {sample_every} steps to: {output_dir}/")
+    print(f"[4/4] Training configuration:", flush=True)
+    print(f"      Steps per epoch: {steps_per_epoch}", flush=True)
+    print(f"      Total epochs: {num_epochs}", flush=True)
+    print(f"      Sample every: {sample_every} steps", flush=True)
+    print(f"\n{'='*60}", flush=True)
+    print("Starting training loop...", flush=True)
+    print('='*60, flush=True)
 
     global_step = 0
     for epoch in range(num_epochs):
-        print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===")
+        print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===", flush=True)
 
         for step_in_epoch in range(steps_per_epoch):
             batch = next(train_gen)
@@ -393,10 +409,10 @@ def main():
             state, loss, rng = train_step(state, batch, rng)
 
             if step_in_epoch % 100 == 0:
-                print(f"Epoch {epoch + 1} | Step {step_in_epoch}/{steps_per_epoch} | Global Step {global_step} | Loss: {loss:.5f}")
+                print(f"Epoch {epoch + 1} | Step {step_in_epoch}/{steps_per_epoch} | Global Step {global_step} | Loss: {loss:.5f}", flush=True)
 
             if global_step % sample_every == 0 and global_step > 0:
-                print(f"Sampling at global step {global_step} (epoch {epoch + 1})...")
+                print(f"Sampling at global step {global_step} (epoch {epoch + 1})...", flush=True)
 
                 # Sample
                 sample_out = sample_protein(state, rng, img_size=CONFIG['img_size'])
@@ -418,11 +434,13 @@ def main():
                 plt.savefig(filepath, dpi=150, bbox_inches='tight')
                 plt.close()
 
-                print(f"Saved: {filepath}")
+                print(f"Saved: {filepath}", flush=True)
 
             global_step += 1
 
-    print("\nTraining complete!")
+    print("\n" + "="*60, flush=True)
+    print("Training complete!", flush=True)
+    print("="*60, flush=True)
 
 
 if __name__ == "__main__":
