@@ -67,7 +67,7 @@ class RMSNorm(nnx.Module):
         input_dtype = x.dtype
         x = x.astype(jnp.float32)
         variance = jnp.mean(x ** 2, axis=-1, keepdims=True)
-        x = x * jnp.rsqrt(variance + self.eps)
+        x = x * (1.0 / jnp.sqrt(variance + self.eps))
         x = x.astype(input_dtype)
         return x * self.weight.value
 
