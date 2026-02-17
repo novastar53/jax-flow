@@ -42,3 +42,6 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["jax_flow*"]
+
+[tool.uv.sources]
+jaxpt = { path = "../jaxpt" }
