@@ -174,9 +174,13 @@ class VisionRotaryEmbeddingFast(nnx.Module):
         freqs_h = jnp.outer(t, freqs)  # [grid_size, half_dim]
         freqs_w = jnp.outer(t, freqs)
 
-        # Broadcast to 2D grid
+        # Broadcast to 2D grid - need to broadcast to same shape before concatenating
         freqs_h = freqs_h[:, None, :]  # [grid_size, 1, half_dim]
         freqs_w = freqs_w[None, :, :]  # [1, grid_size, half_dim]
+
+        # Broadcast both to [grid_size, grid_size, half_dim] then concatenate
+        freqs_h = jnp.broadcast_to(freqs_h, (grid_size, grid_size, half_dim))
+        freqs_w = jnp.broadcast_to(freqs_w, (grid_size, grid_size, half_dim))
 
         # Concatenate h and w frequencies: [grid_size, grid_size, dim]
         freqs = jnp.concatenate([freqs_h, freqs_w], axis=-1)
