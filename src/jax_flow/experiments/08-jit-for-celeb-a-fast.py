@@ -61,7 +61,7 @@ class DenoiseConfig(Config):
         self.n_layer = CONFIG["depth"]
         self.n_mlp_hidden = CONFIG["mlp_dim"]
         self.block_size = (CONFIG["img_size"] // CONFIG["patch_size"]) ** 2
-        self.sdpa_implementation = "cudnn"  # Use cuDNN flash attention
+        self.sdpa_implementation = "cudnn" if jax.default_backend() == "gpu" else "xla"
         self.glu_activation = "swish"
         self.mlp_bias = False
         self.attention_bias = False
