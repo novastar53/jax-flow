@@ -45,7 +45,7 @@ CONFIG = {
     "depth": 3,
     "heads": 8,
     "mlp_dim": 1024,
-    "batch_size": 32,
+    "batch_size": 64,
     "lr": 1e-4,
     "epochs": 10,
     "seed": 42
