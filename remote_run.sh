@@ -10,6 +10,7 @@ set -e
 
 REMOTE_DIR="~/jax_fusion"
 REPO_URL="https://github.com/novastar53/jax-flow.git"
+JAXPT_REPO_URL="https://github.com/novastar53/jaxpt.git"
 DEFAULT_SESSION="jax_fusion"
 LOG_DIR="remote_logs"
 REMOTE_LOG_DIR="~/.cache/jax_fusion"
@@ -71,6 +72,18 @@ setup_remote() {
     remote_exec "bash -l" << EOF
 set -e
 REMOTE_DIR=\$(eval echo ~/jax_fusion)
+JAXPT_DIR=\$(eval echo ~/jaxpt)
+
+# Clone/update jaxpt dependency in parent directory
+if [ -d "\$JAXPT_DIR" ]; then
+    echo "Updating jaxpt..."
+    cd "\$JAXPT_DIR" && git fetch origin && git checkout main && git pull origin main
+else
+    echo "Cloning jaxpt to parent directory..."
+    git clone $JAXPT_REPO_URL "\$JAXPT_DIR"
+fi
+
+# Clone/update jax_fusion
 if [ -d "\$REMOTE_DIR" ]; then
     cd "\$REMOTE_DIR" && git fetch origin && git checkout main && git pull origin main
 else
