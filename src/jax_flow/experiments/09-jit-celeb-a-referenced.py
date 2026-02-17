@@ -634,7 +634,7 @@ def create_model_and_optimizer(rng_key, config, mesh, total_steps: int = 10000):
         # Get the parameter structure and create mask
         graphdef, params, _ = nnx.split(model, nnx.Param, nnx.Variable)
         weight_decay_mask = jax.tree.map(
-            lambda p: len(p.value.shape) >= 2,  # Only decay 2D+ tensors (weights, not biases/norms)
+            lambda p: len(p.shape) >= 2,  # Only decay 2D+ tensors (weights, not biases/norms)
             params
         )
 
