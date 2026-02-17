@@ -227,13 +227,12 @@ class JustProteinTransformer(nn.Module):
 def celeba_generator_hf(split="train", batch_size=32, img_size=64):
     """
     HuggingFace-based CelebA dataloader for the JIT Flow Matching model.
-    Uses the huggan/CelebA-faces dataset which is more reliable than Google Drive.
+    Uses the flwrlabs/celeba dataset.
     """
     # Load CelebA from HuggingFace (streaming mode to avoid disk space issues)
     print(f"Loading CelebA dataset from HuggingFace (split={split})...")
-    ds = load_dataset("huggan/CelebA-faces", split="train", streaming=True)
+    ds = load_dataset("flwrlabs/celeba", split=split, streaming=True)
 
-    # Convert to list for easier batching (CelebA has ~200k images)
     # For memory efficiency, we'll batch as we iterate
     ds_iterator = iter(ds)
 
