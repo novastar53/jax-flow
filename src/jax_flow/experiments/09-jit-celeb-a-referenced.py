@@ -747,7 +747,8 @@ def sample(model, rng, img_size, steps=50, noise_scale=1.0, t_eps=1e-3, batch_si
         # Model predicts the clean image x_1 from the current noised state
         x_clean_pred = model(x_current, t_vec)
         # Compute velocity: v = (x_1 - x_t) / (1 - t)
-        denom = 1.0 - t_scalar
+        # Use t_eps to avoid division by zero as t approaches 1
+        denom = jnp.maximum(1.0 - t_scalar, t_eps)
         v = (x_clean_pred - x_current) / denom
         # Euler step
         x_current = x_current + v * dt
