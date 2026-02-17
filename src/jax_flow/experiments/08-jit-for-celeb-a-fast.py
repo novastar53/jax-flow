@@ -127,7 +127,7 @@ CONFIG = {
     "mlp_dim": 1024,
     "batch_size": 64,
     "lr": 1e-4,
-    "epochs": 10,
+    "epochs": 1,
     "seed": 42
 }
 
