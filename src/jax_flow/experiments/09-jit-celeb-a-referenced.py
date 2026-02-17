@@ -657,24 +657,24 @@ class EMATracker:
         # Get all parameters from the model
         graphdef, params, _ = nnx.split(model, nnx.Param, nnx.Variable)
 
-        # Initialize EMA parameters as copies
-        self.ema_params1 = jax.tree.map(lambda x: x.value.copy(), params)
-        self.ema_params2 = jax.tree.map(lambda x: x.value.copy(), params)
+        # Initialize EMA parameters as copies (params are already JAX arrays from nnx.split)
+        self.ema_params1 = jax.tree.map(lambda x: x.copy(), params)
+        self.ema_params2 = jax.tree.map(lambda x: x.copy(), params)
 
     def update(self, model):
         """Update EMA parameters."""
         _, params, _ = nnx.split(model, nnx.Param, nnx.Variable)
 
-        # Update EMA1
+        # Update EMA1 (params are already JAX arrays)
         self.ema_params1 = jax.tree.map(
-            lambda ema, p: self.decay1 * ema + (1 - self.decay1) * p.value,
+            lambda ema, p: self.decay1 * ema + (1 - self.decay1) * p,
             self.ema_params1,
             params
         )
 
         # Update EMA2
         self.ema_params2 = jax.tree.map(
-            lambda ema, p: self.decay2 * ema + (1 - self.decay2) * p.value,
+            lambda ema, p: self.decay2 * ema + (1 - self.decay2) * p,
             self.ema_params2,
             params
         )
