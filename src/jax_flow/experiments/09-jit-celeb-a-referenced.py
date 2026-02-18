@@ -39,10 +39,9 @@ import orbax.checkpoint as ocp
 CONFIG = {
     "img_size": 64,
     "patch_size": 4,
-    "dim_raw": 4 * 4 * 3,
     "channels": 3,
-    "dim_bottleneck": 128,
-    "dim_model": 256,
+    "dim_bottleneck": 32,
+    "dim_model": 192,
     "depth": 6,
     "heads": 8,
     "mlp_ratio": 4.0,
@@ -113,39 +112,45 @@ def modulate(x, shift, scale):
 # 3. Patch Embedding
 # ==========================================
 
-class LinearBottleneckPatchEmbed(nnx.Module):
-    """Bottleneck patch embedding like JiT."""
+class ConvBottleneckPatchEmbed(nnx.Module):
+    """Conv2d-based bottleneck patch embedding matching JiT reference."""
     def __init__(self, patch_size: int, dim_bottleneck: int, dim_model: int, rngs: nnx.Rngs):
         self.patch_size = patch_size
 
-        # Two-stage bottleneck
-        self.compress = nnx.Linear(
-            patch_size * patch_size * 3,
-            dim_bottleneck,
+        # proj1: Conv2d with stride=patch_size (patchify + expand channels)
+        self.proj1 = nnx.Conv(
+            in_features=3,
+            out_features=dim_bottleneck,
+            kernel_size=(patch_size, patch_size),
+            strides=(patch_size, patch_size),
             use_bias=False,
             rngs=rngs
         )
-        self.expand = nnx.Linear(
-            dim_bottleneck,
-            dim_model,
+        # proj2: 1x1 Conv (bottleneck projection)
+        self.proj2 = nnx.Conv(
+            in_features=dim_bottleneck,
+            out_features=dim_model,
+            kernel_size=(1, 1),
             use_bias=True,
             rngs=rngs
         )
 
     def __call__(self, x):
-        # x: [B, H, W, C]
-        B, H, W, C = x.shape
-        p = self.patch_size
+        # x: [B, H, W, C] = [B, 64, 64, 3]
+        # Flax NNX Conv expects HWC format
 
-        # Patchify
-        x = x.reshape(B, H // p, p, W // p, p, C)
-        x = x.transpose(0, 1, 3, 2, 4, 5)
-        x = x.reshape(B, -1, p * p * C)
+        # Patchify + expand
+        x = self.proj1(x)  # [B, 16, 16, 32]
+        x = self.proj2(x)  # [B, 16, 16, 192]
 
-        # Bottleneck
-        x = self.compress(x)
-        x = self.expand(x)
+        # Flatten spatial to sequence: [B, 16, 16, 192] → [B, 256, 192]
+        x = x.reshape(x.shape[0], -1, x.shape[-1])
+
         return x
+
+
+# Alias for backwards compatibility
+LinearBottleneckPatchEmbed = ConvBottleneckPatchEmbed
 
 
 # ==========================================
@@ -308,8 +313,11 @@ class JiTBlock(nnx.Module):
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLU(hidden_size, mlp_hidden_dim, rngs=rngs)
 
-        # AdaLN modulation: outputs 6 values
-        self.adaLN_modulation = nnx.Linear(hidden_size, 6 * hidden_size, use_bias=True, rngs=rngs)
+        # AdaLN modulation: outputs 6 values (Sequential with SiLU + Linear, matching JiT reference)
+        self.adaLN_modulation = nnx.Sequential(
+            nnx.silu,
+            nnx.Linear(hidden_size, 6 * hidden_size, use_bias=True, rngs=rngs)
+        )
 
     def __call__(self, x, c, rope=None):
         # Get AdaLN params
@@ -334,13 +342,17 @@ class JiTBlock(nnx.Module):
 # ==========================================
 
 class FinalLayer(nnx.Module):
-    """Final layer with AdaLN modulation."""
+    """Final layer with AdaLN modulation (matching JiT reference)."""
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int, rngs: nnx.Rngs):
         self.norm_final = RMSNorm(hidden_size, eps=1e-6, rngs=rngs)
         self.linear = nnx.Linear(
             hidden_size, patch_size * patch_size * out_channels, use_bias=True, rngs=rngs
         )
-        self.adaLN_modulation = nnx.Linear(hidden_size, 2 * hidden_size, use_bias=True, rngs=rngs)
+        # SiLU + Linear (matching JiT reference)
+        self.adaLN_modulation = nnx.Sequential(
+            nnx.silu,
+            nnx.Linear(hidden_size, 2 * hidden_size, use_bias=True, rngs=rngs)
+        )
 
     def __call__(self, x, c):
         shift, scale = jnp.split(self.adaLN_modulation(c), 2, axis=-1)
@@ -461,18 +473,22 @@ class JiTDenoisingTransformer(nnx.Module):
         """
         for block in self.blocks:
             ada_ln = block.adaLN_modulation
-            # Direct Linear layer, not a Sequential
-            if isinstance(ada_ln, nnx.Linear):
-                ada_ln.kernel.value = jnp.zeros_like(ada_ln.kernel.value)
-                if ada_ln.bias is not None:
-                    ada_ln.bias.value = jnp.zeros_like(ada_ln.bias.value)
+            # Sequential with [silu, Linear] - access the Linear layer
+            if isinstance(ada_ln, nnx.Sequential):
+                linear_layer = ada_ln.layers[-1]
+                if isinstance(linear_layer, nnx.Linear):
+                    linear_layer.kernel.value = jnp.zeros_like(linear_layer.kernel.value)
+                    if linear_layer.bias is not None:
+                        linear_layer.bias.value = jnp.zeros_like(linear_layer.bias.value)
 
-        # Zero out final layer adaLN
+        # Zero out final layer adaLN (Sequential with [silu, Linear])
         final_ada_ln = self.final_layer.adaLN_modulation
-        if isinstance(final_ada_ln, nnx.Linear):
-            final_ada_ln.kernel.value = jnp.zeros_like(final_ada_ln.kernel.value)
-            if final_ada_ln.bias is not None:
-                final_ada_ln.bias.value = jnp.zeros_like(final_ada_ln.bias.value)
+        if isinstance(final_ada_ln, nnx.Sequential):
+            linear_layer = final_ada_ln.layers[-1]
+            if isinstance(linear_layer, nnx.Linear):
+                linear_layer.kernel.value = jnp.zeros_like(linear_layer.kernel.value)
+                if linear_layer.bias is not None:
+                    linear_layer.bias.value = jnp.zeros_like(linear_layer.bias.value)
 
         # Zero out final linear layer
         final_linear = self.final_layer.linear
