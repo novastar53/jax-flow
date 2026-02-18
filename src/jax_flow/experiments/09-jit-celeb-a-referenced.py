@@ -61,6 +61,7 @@ CONFIG = {
     "noise_scale": 1.0,
     "ema_decay1": 0.9999,
     "ema_decay2": 0.999943,
+    "use_ema": True,  # Toggle to sample from EMA (True) or direct model (False)
 }
 
 # ==========================================
@@ -862,9 +863,12 @@ def main():
 
                 if global_step % sample_every == 0 and global_step > 0:
                     print(f"Sampling at step {global_step}...", flush=True)
-                    # Use EMA model for sampling
-                    ema_model = ema_tracker.apply_to_model(model)
-                    sample_out = sample(ema_model, rng, img_size=CONFIG['img_size'],
+                    # Use EMA or direct model based on toggle
+                    if CONFIG.get('use_ema', True):
+                        sample_model = ema_tracker.apply_to_model(model)
+                    else:
+                        sample_model = model
+                    sample_out = sample(sample_model, rng, img_size=CONFIG['img_size'],
                                         noise_scale=CONFIG['noise_scale'], t_eps=CONFIG['t_eps'])
 
                     img = np.array(sample_out[0])
