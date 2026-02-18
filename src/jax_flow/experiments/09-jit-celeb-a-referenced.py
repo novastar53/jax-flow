@@ -48,16 +48,14 @@ CONFIG = {
     "mlp_ratio": 4.0,
     "batch_size": 64,
     "lr": 1e-4,
-    "min_lr": 1e-6,
     "epochs": 50,
     "warmup_epochs": 5,
-    "lr_schedule": "cosine",
-    "weight_decay": 0.1,
+    "weight_decay": 0.0,
     "grad_clip": 1.0,
     "seed": 42,
     "P_mean": -0.8,  # Logit-normal params
     "P_std": 0.8,
-    "t_eps": 1e-3,
+    "t_eps": 0.05,
     "noise_scale": 1.0,
     "ema_decay1": 0.9999,
     "ema_decay2": 0.999943,
@@ -602,7 +600,7 @@ class PrefetchGenerator:
 # 10. Training
 # ==========================================
 
-def create_model_and_optimizer(rng_key, config, mesh, total_steps: int = 10000):
+def create_model_and_optimizer(rng_key, config, mesh):
     """Create model and optimizer with proper sharding and weight decay mask."""
     with mesh:
         rngs = nnx.Rngs(rng_key)
@@ -613,19 +611,9 @@ def create_model_and_optimizer(rng_key, config, mesh, total_steps: int = 10000):
         dummy_t = jnp.ones((1, 1))
         _ = model(dummy_x, dummy_t)
 
-        # Learning rate schedule with warmup and cosine decay
-        schedule = optax.warmup_cosine_decay_schedule(
-            init_value=0.0,
-            peak_value=config['lr'],
-            warmup_steps=config['warmup_epochs'] * (total_steps // config['epochs']),
-            decay_steps=total_steps,
-            end_value=config['min_lr'],
-        )
-
-        # Use AdamW with weight decay applied to all parameters
-        # (weight decay masking would require additional complexity with nnx)
+        # Constant LR (matching JiT reference - no decay)
         tx = optax.adamw(
-            learning_rate=schedule,
+            learning_rate=config['lr'],
             weight_decay=config['weight_decay'],
         )
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
@@ -788,7 +776,7 @@ def main():
     rng = jax.random.PRNGKey(CONFIG['seed'])
     rng, init_rng = jax.random.split(rng)
 
-    model, optimizer = create_model_and_optimizer(init_rng, CONFIG, mesh, total_steps)
+    model, optimizer = create_model_and_optimizer(init_rng, CONFIG, mesh)
     print(f"    Model: {CONFIG['dim_model']}d, {CONFIG['depth']} layers", flush=True)
     print(f"    Batch size: {CONFIG['batch_size']}, LR: {CONFIG['lr']}", flush=True)
 
