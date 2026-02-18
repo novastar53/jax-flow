@@ -61,7 +61,7 @@ CONFIG = {
     "noise_scale": 1.0,
     "ema_decay1": 0.9999,
     "ema_decay2": 0.999943,
-    "use_ema": True,  # Toggle to sample from EMA (True) or direct model (False)
+    "use_ema": False,  # Toggle to sample from EMA (True) or direct model (False)
 }
 
 # ==========================================
