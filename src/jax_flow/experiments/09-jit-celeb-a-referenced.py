@@ -460,29 +460,20 @@ class JiTDenoisingTransformer(nnx.Module):
         """Initialize weights matching JiT reference.
         Critical: Zero out adaLN modulation and final layer for training stability.
         """
-        # Note: Linear layers in flax.nnx use default init which is similar to PyTorch
-        # We need to zero out the adaLN modulation weights and biases
         for block in self.blocks:
-            # Zero out the last layer of adaLN_modulation (the linear layer)
             ada_ln = block.adaLN_modulation
-            # Get the last linear layer in the Sequential
-            if hasattr(ada_ln, 'layers') and len(ada_ln.layers) >= 2:
-                # It's a Sequential with [SiLU, Linear] - access the Linear layer
-                linear_layer = ada_ln.layers[-1]
-                if isinstance(linear_layer, nnx.Linear):
-                    # Zero out weights and biases
-                    linear_layer.kernel.value = jnp.zeros_like(linear_layer.kernel.value)
-                    if linear_layer.bias is not None:
-                        linear_layer.bias.value = jnp.zeros_like(linear_layer.bias.value)
+            # Direct Linear layer, not a Sequential
+            if isinstance(ada_ln, nnx.Linear):
+                ada_ln.kernel.value = jnp.zeros_like(ada_ln.kernel.value)
+                if ada_ln.bias is not None:
+                    ada_ln.bias.value = jnp.zeros_like(ada_ln.bias.value)
 
-        # Zero out final layer adaLN and linear
+        # Zero out final layer adaLN
         final_ada_ln = self.final_layer.adaLN_modulation
-        if hasattr(final_ada_ln, 'layers') and len(final_ada_ln.layers) >= 2:
-            linear_layer = final_ada_ln.layers[-1]
-            if isinstance(linear_layer, nnx.Linear):
-                linear_layer.kernel.value = jnp.zeros_like(linear_layer.kernel.value)
-                if linear_layer.bias is not None:
-                    linear_layer.bias.value = jnp.zeros_like(linear_layer.bias.value)
+        if isinstance(final_ada_ln, nnx.Linear):
+            final_ada_ln.kernel.value = jnp.zeros_like(final_ada_ln.kernel.value)
+            if final_ada_ln.bias is not None:
+                final_ada_ln.bias.value = jnp.zeros_like(final_ada_ln.bias.value)
 
         # Zero out final linear layer
         final_linear = self.final_layer.linear
