@@ -26,7 +26,7 @@ mesh = Mesh(devices, ["devices"])
 
 
 # Enable mixed precision matmul for better performance
-if platform == "cpu":
+if platform == "cuda":
     jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
 
 import jax.numpy as jnp
@@ -61,7 +61,7 @@ class JiTConfig:
     channels: int = 3
     dim_bottleneck: int = 32
     dim_model: int = 256
-    depth: int = 8
+    depth: int = 2
     heads: int = 8
     mlp_ratio: float = 4.0
 
@@ -115,10 +115,8 @@ class RMSNorm(nnx.Module):
     def __call__(self, x):
         # RMSNorm should preserve the input dtype
         variance = jnp.mean(x ** 2, axis=-1, keepdims=True)
-        # Use rsqrt like PyTorch reference
         x = x * jax.lax.rsqrt(variance + self.eps)
-        # Convert weight to match computation dtype
-        return x * self.weight.value
+        return x * self.weight.value.astype(self.dtype)
 
 
 def modulate(x, shift, scale):
@@ -229,7 +227,7 @@ class VisionRotaryEmbeddingFast(nnx.Module):
         # Expand cos/sin for batch and head dims: [1, 1, N, D]
         cos = self.freqs_cos.value[None, None, :, :]
         sin = self.freqs_sin.value[None, None, :, :]
-        return x * cos + self.rotate_half(x) * sin
+        return (x * cos + self.rotate_half(x) * sin).astype(config.dtype)
 
 
 class Attention(nnx.Module):
@@ -561,18 +559,12 @@ class JiTDenoisingTransformer(nnx.Module):
     def __call__(self, x_noisy, t):
         # x_noisy: [B, H, W, C]
         # t: [B, 1]
-        
-        # Ensure inputs are in the model's computation dtype
-        if x_noisy.dtype != self.config.dtype:
-            x_noisy = x_noisy.astype(self.config.dtype)
-        if t.dtype != self.config.dtype:
-            t = t.astype(self.config.dtype)
 
         # Patch embed
         x = self.patch_embed(x_noisy)  # [B, N, D]
 
         # Add positional embeddings
-        x = x + self.pos_embed.value
+        x = (x + self.pos_embed.value).astype(self.config.dtype)
 
         # Get time embedding
         c = self.t_embedder(t)  # [B, D]
@@ -745,16 +737,15 @@ def sample(model, rng, img_size, steps=50, noise_scale=1.0, t_eps=1e-3, batch_si
     """Generate samples using Euler method (matching JiT reference)."""
     print(f"Sampling with {steps} steps...")
 
-    # Use model's dtype for sampling
-    model_dtype = model.config.dtype
-    x_current = jax.random.normal(rng, (batch_size, img_size, img_size, 3), dtype=model_dtype) * noise_scale
+    activation_dtype = model.config.dtype
+    x_current = jax.random.normal(rng, (batch_size, img_size, img_size, 3), dtype=activation_dtype) * noise_scale
     # Use linspace from 0 to 0.99 with steps+1 points (don't go all the way to 1.0 to avoid instability)
     # This gives us 'steps' intervals to iterate through
     t_values = np.linspace(0.0, 0.99, steps + 1)
     dt = t_values[1] - t_values[0]
 
     for t_scalar in t_values[:-1]:
-        t_vec = jnp.ones((batch_size, 1), dtype=model_dtype) * t_scalar
+        t_vec = jnp.ones((batch_size, 1), dtype=activation_dtype) * t_scalar
         # Model predicts the clean image x_1 from the current noised state
         x_clean_pred = model(x_current, t_vec)
         # Compute velocity: v = (x_1 - x_t) / (1 - t)

@@ -14,6 +14,10 @@
 
 set -e
 
+if [[ "$TERM_PROGRAM" == "ghostty" ]]; then
+    export TERM=xterm-256color
+fi
+
 REMOTE_DIR="~/jax_fusion"
 REPO_URL="https://github.com/novastar53/jax-flow.git"
 JAXPT_REPO_URL="https://github.com/novastar53/jaxpt.git"
