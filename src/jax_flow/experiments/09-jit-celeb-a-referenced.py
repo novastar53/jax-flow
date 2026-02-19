@@ -259,7 +259,7 @@ class Attention(nnx.Module):
 
         grid_size = self.config.img_size // self.config.patch_size
         head_dim = self.config.dim_model // self.config.heads
-        self.feat_rope = VisionRotaryEmbeddingFast(
+        self.rope = VisionRotaryEmbeddingFast(
             dim=head_dim,
             grid_size=grid_size,
             theta=10000.0
