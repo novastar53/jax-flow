@@ -10,7 +10,8 @@ import json
 import threading
 import queue
 import copy
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from typing import List
 
 # Force unbuffered output for real-time logging
@@ -821,16 +822,15 @@ def main():
 
     with mesh:
         global_step = 0
+        step_times = []
+        training_start = time.perf_counter()
 
-        # JIT the train step inside mesh context like jaxpt does
         train_step_jit = nnx.jit(train_step_fn)
 
-        # Debug first batch
         first_batch = next(train_gen)
         print(f"\nDebug - First batch: shape={first_batch.shape}, "
               f"range=[{first_batch.min():.3f}, {first_batch.max():.3f}]", flush=True)
 
-        # Save a row of training images from first batch
         train_imgs = first_batch[:8]
         train_imgs = (train_imgs + 1.0) / 2.0
         fig, axes = plt.subplots(1, 8, figsize=(16, 2))
@@ -843,7 +843,6 @@ def main():
         plt.close()
         print(f"Training batch sample saved: {os.path.join(output_dir, 'training_batch_sample.png')}", flush=True)
 
-        # Generate a sample before training to verify sampling works
         print("\nGenerating pre-training sample...", flush=True)
         pretrain_sample = sample(model, rng, img_size=CONFIG['img_size'],
                                  noise_scale=CONFIG['noise_scale'], t_eps=CONFIG['t_eps'])
@@ -863,8 +862,11 @@ def main():
         for epoch in range(num_epochs):
             print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===", flush=True)
             epoch_losses = []
+            epoch_start = time.perf_counter()
 
             for step_in_epoch in range(steps_per_epoch):
+                step_start = time.perf_counter()
+
                 batch = next(train_gen)
                 batch = jax.device_put(batch, data_sharding)
 
@@ -875,17 +877,26 @@ def main():
                 optimizer.update(model, grads)
                 epoch_losses.append(float(loss))
 
-                # Update EMA after each training step
                 ema_tracker.update(model)
 
-                if step_in_epoch % 100 == 0:
+                step_time = time.perf_counter() - step_start
+                step_times.append(step_time)
+                step_times = step_times[-100:]
+
+                if step_in_epoch % 50 == 0:
+                    avg_step_time = sum(step_times) / len(step_times)
+                    samples_per_sec = CONFIG['batch_size'] / avg_step_time
+                    steps_remaining = total_steps - global_step
+                    eta_seconds = steps_remaining * avg_step_time
+                    eta_str = str(timedelta(seconds=int(eta_seconds)))
                     avg_loss = sum(epoch_losses[-100:]) / len(epoch_losses[-100:]) if epoch_losses else float(loss)
-                    print(f"Epoch {epoch + 1} | Step {step_in_epoch}/{steps_per_epoch} | "
-                          f"Loss: {loss:.5f} | Avg: {avg_loss:.5f}", flush=True)
+
+                    print(f"Epoch {epoch+1}/{num_epochs} | Step {step_in_epoch}/{steps_per_epoch} | "
+                          f"Loss: {loss:.5f} (avg: {avg_loss:.5f}) | "
+                          f"{samples_per_sec:.1f} samples/sec | ETA: {eta_str}", flush=True)
 
                 if global_step % sample_every == 0 and global_step > 0:
                     print(f"Sampling at step {global_step}...", flush=True)
-                    # Use EMA or direct model based on toggle
                     if CONFIG.get('use_ema', True):
                         sample_model = ema_tracker.apply_to_model(model)
                     else:
@@ -912,8 +923,15 @@ def main():
 
                 global_step += 1
 
+            epoch_time = time.perf_counter() - epoch_start
+            epoch_samples = steps_per_epoch * CONFIG['batch_size']
+            epoch_samples_per_sec = epoch_samples / epoch_time
+            print(f"Epoch {epoch+1} completed in {timedelta(seconds=int(epoch_time))} "
+                  f"({epoch_samples_per_sec:.1f} samples/sec)", flush=True)
+
+    total_time = time.perf_counter() - training_start
     print("\n" + "="*60, flush=True)
-    print("Training complete!", flush=True)
+    print(f"Training complete! Total time: {timedelta(seconds=int(total_time))}", flush=True)
     print("="*60, flush=True)
 
 
