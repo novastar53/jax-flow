@@ -41,6 +41,20 @@ from jax_flow.datasets.celeba_cached import (
     cache_dataset,
 )
 
+
+def _get_best_attention_implementation():
+    """Auto-detect the best flash attention implementation."""
+    try:
+        # Check if CUDA is available and working
+        device = jax.devices()[0]
+        if device.platform == 'cuda':
+            return 'cudnn'
+        elif device.platform in ('tpu', 'gpu'):
+            return 'xla'
+    except Exception:
+        pass
+    return None  # Fall back to manual attention
+
 # ==========================================
 # 1. Configuration (Matching JiT official)
 # ==========================================
@@ -244,6 +258,7 @@ class Attention(nnx.Module):
     def __init__(self, dim: int, num_heads: int, rngs: nnx.Rngs):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.attention_impl = _get_best_attention_implementation()
 
         self.qkv = nnx.Linear(dim, dim * 3, use_bias=True, rngs=rngs)
         self.proj = nnx.Linear(dim, dim, rngs=rngs)
@@ -263,7 +278,7 @@ class Attention(nnx.Module):
         qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]  # Each [B, N, H, D]
 
-        # Transpose to [B, H, N, D] for attention
+        # Transpose to [B, H, N, D] for QK norm and RoPE
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
@@ -277,14 +292,29 @@ class Attention(nnx.Module):
             q = rope(q)
             k = rope(k)
 
-        # Scaled dot-product attention
-        scale = self.head_dim ** -0.5
-        attn = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * scale
-        attn = jax.nn.softmax(attn, axis=-1)
-        out = jnp.matmul(attn, v)
+        # Flash attention implementation
+        if self.attention_impl is not None:
+            # Transpose back for flash attention: [B, H, N, D] -> [B, N, H, D]
+            q = q.transpose(0, 2, 1, 3)
+            k = k.transpose(0, 2, 1, 3)
+            v = v.transpose(0, 2, 1, 3)
+            
+            out = jax.nn.dot_product_attention(
+                q, k, v,
+                implementation=self.attention_impl,
+                is_causal=False  # Vision attention: no causal masking
+            )
+        else:
+            # Fallback to manual implementation
+            scale = self.head_dim ** -0.5
+            attn = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+            attn = jax.nn.softmax(attn, axis=-1)
+            out = jnp.matmul(attn, v)
+            # Reshape back: [B, H, N, D] -> [B, N, H, D]
+            out = out.transpose(0, 2, 1, 3)
 
-        # Reshape back: [B, H, N, D] -> [B, N, C]
-        out = out.transpose(0, 2, 1, 3).reshape(B, N, C)
+        # Final reshape: [B, N, H, D] -> [B, N, C]
+        out = out.reshape(B, N, C)
         out = self.proj(out)
         return out
 
