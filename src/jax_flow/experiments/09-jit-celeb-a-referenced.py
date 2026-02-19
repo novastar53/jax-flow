@@ -42,7 +42,7 @@ CONFIG = {
     "channels": 3,
     "dim_bottleneck": 32,
     "dim_model": 192,
-    "depth": 6,
+    "depth": 8,
     "heads": 8,
     "mlp_ratio": 4.0,
     "batch_size": 64,
