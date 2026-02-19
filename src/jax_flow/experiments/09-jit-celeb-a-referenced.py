@@ -67,7 +67,7 @@ CONFIG = {
     "ema_decay1": 0.9999,
     "ema_decay2": 0.999943,
     "use_ema": False,
-    "use_cached_data": True,
+    "use_cached_data": False,
 }
 
 # ==========================================
