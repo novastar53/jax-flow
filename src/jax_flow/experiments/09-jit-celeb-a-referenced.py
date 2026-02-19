@@ -34,6 +34,13 @@ from PIL import Image
 from huggingface_hub import login, upload_folder, snapshot_download
 import orbax.checkpoint as ocp
 
+from jax_flow.datasets.celeba_cached import (
+    make_dataloader as make_cached_dataloader,
+    DataConfig as CachedDataConfig,
+    is_cached,
+    cache_dataset,
+)
+
 # ==========================================
 # 1. Configuration (Matching JiT official)
 # ==========================================
@@ -46,20 +53,21 @@ CONFIG = {
     "depth": 8,
     "heads": 8,
     "mlp_ratio": 4.0,
-    "batch_size": 64,
+    "batch_size": 128,
     "lr": 1e-4,
     "epochs": 50,
     "warmup_epochs": 5,
     "weight_decay": 0.0,
     "grad_clip": 1.0,
     "seed": 42,
-    "P_mean": -0.8,  # Logit-normal params
+    "P_mean": -0.8,
     "P_std": 0.8,
     "t_eps": 0.05,
     "noise_scale": 1.0,
     "ema_decay1": 0.9999,
     "ema_decay2": 0.999943,
-    "use_ema": False,  # Toggle to sample from EMA (True) or direct model (False)
+    "use_ema": False,
+    "use_cached_data": True,
 }
 
 # ==========================================
@@ -583,8 +591,8 @@ def celeba_generator_hf(split="train", batch_size=32, img_size=64, seed=42):
 
         if len(batch_imgs) == batch_size:
             batch = np.stack(batch_imgs, axis=0)
-            batch = (batch * 2.0) - 1.0  # Normalize to [-1, 1]
-            yield batch
+            batch = (batch * 2.0) - 1.0
+            yield batch, None
 
 
 class PrefetchGenerator:
@@ -773,22 +781,34 @@ def main():
     print(f"      Platform: {jax.default_backend()}", flush=True)
     mesh = Mesh(devices, ["devices"])
 
-    # Setup data with prefetching
-    print("\n[1/5] Setting up data loader with prefetching...", flush=True)
-    train_gen = celeba_generator_hf(
-        split="train",
-        batch_size=CONFIG['batch_size'],
-        img_size=CONFIG['img_size'],
-        seed=CONFIG['seed']
-    )
-    # Wrap with prefetch generator to overlap data loading with GPU compute
-    train_gen = PrefetchGenerator(train_gen, buffer_size=4)
-    print(f"    Prefetch buffer: 4 batches", flush=True)
+    print("\n[1/5] Setting up data loader...", flush=True)
+    if CONFIG.get('use_cached_data', True):
+        if not is_cached(CONFIG['img_size'], "train"):
+            print("    Cached data not found. Caching dataset (one-time setup)...", flush=True)
+            cache_dataset(CONFIG['img_size'])
 
-    data_sharding = NamedSharding(mesh, PartitionSpec("devices"))
+        data_cfg = CachedDataConfig(
+            batch_size=CONFIG['batch_size'],
+            img_size=CONFIG['img_size'],
+            seed=CONFIG['seed'],
+            shuffle=True,
+        )
+        train_gen_raw = make_cached_dataloader("train", data_cfg)
+        train_gen = PrefetchGenerator(train_gen_raw, buffer_size=8)
+        print(f"    Using cached data with prefetch buffer: 8 batches", flush=True)
+        num_train_samples = 162000
+    else:
+        train_gen_raw = celeba_generator_hf(
+            split="train",
+            batch_size=CONFIG['batch_size'],
+            img_size=CONFIG['img_size'],
+            seed=CONFIG['seed']
+        )
+        train_gen = PrefetchGenerator(train_gen_raw, buffer_size=4)
+        print(f"    Using streaming data with prefetch buffer: 4 batches", flush=True)
+        num_train_samples = 162000
 
-    # Training config (define before model creation)
-    steps_per_epoch = 162000 // CONFIG['batch_size']
+    steps_per_epoch = num_train_samples // CONFIG['batch_size']
     num_epochs = CONFIG['epochs']
     sample_every = 2000
     total_steps = steps_per_epoch * num_epochs
@@ -827,7 +847,7 @@ def main():
 
         train_step_jit = nnx.jit(train_step_fn)
 
-        first_batch = next(train_gen)
+        first_batch, _ = next(train_gen)
         print(f"\nDebug - First batch: shape={first_batch.shape}, "
               f"range=[{first_batch.min():.3f}, {first_batch.max():.3f}]", flush=True)
 
@@ -867,8 +887,7 @@ def main():
             for step_in_epoch in range(steps_per_epoch):
                 step_start = time.perf_counter()
 
-                batch = next(train_gen)
-                batch = jax.device_put(batch, data_sharding)
+                batch, _ = next(train_gen)
 
                 loss, grads, rng = train_step_jit(
                     model, batch, rng,
