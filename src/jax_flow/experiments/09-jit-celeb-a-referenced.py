@@ -13,12 +13,15 @@ import copy
 import time
 from datetime import datetime, timedelta
 from typing import List
+from dataclasses import dataclass
 
 # Force unbuffered output for real-time logging
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1, encoding='utf-8', errors='replace')
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1, encoding='utf-8', errors='replace')
 
 import jax
+# Enable mixed precision matmul for better performance
+jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 import jax.numpy as jnp
 import flax.nnx as nnx
@@ -42,47 +45,55 @@ from jax_flow.datasets.celeba_cached import (
 )
 
 
-def _get_best_attention_implementation():
-    """Auto-detect the best flash attention implementation."""
-    try:
-        # Check if CUDA is available and working
-        device = jax.devices()[0]
-        if device.platform == 'cuda':
-            return 'cudnn'
-        elif device.platform in ('tpu', 'gpu'):
-            return 'xla'
-    except Exception:
-        pass
-    return None  # Fall back to manual attention
-
 # ==========================================
 # 1. Configuration (Matching JiT official)
 # ==========================================
-CONFIG = {
-    "img_size": 128,
-    "patch_size": 8,
-    "channels": 3,
-    "dim_bottleneck": 32,
-    "dim_model": 256,
-    "depth": 8,
-    "heads": 8,
-    "mlp_ratio": 4.0,
-    "batch_size": 128,
-    "lr": 1e-4,
-    "epochs": 50,
-    "warmup_epochs": 5,
-    "weight_decay": 0.0,
-    "grad_clip": 1.0,
-    "seed": 42,
-    "P_mean": -0.8,
-    "P_std": 0.8,
-    "t_eps": 0.05,
-    "noise_scale": 1.0,
-    "ema_decay1": 0.9999,
-    "ema_decay2": 0.999943,
-    "use_ema": False,
-    "use_cached_data": False,
-}
+
+@dataclass
+class JiTConfig:
+    # Model architecture
+    img_size: int = 128
+    patch_size: int = 8
+    channels: int = 3
+    dim_bottleneck: int = 32
+    dim_model: int = 256
+    depth: int = 8
+    heads: int = 8
+    mlp_ratio: float = 4.0
+    
+    # Training hyperparameters
+    batch_size: int = 128
+    lr: float = 1e-4
+    epochs: int = 50
+    warmup_epochs: int = 5
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0
+    seed: int = 42
+    
+    # Flow matching parameters
+    P_mean: float = -0.8
+    P_std: float = 0.8
+    t_eps: float = 0.05
+    noise_scale: float = 1.0
+    
+    # EMA parameters
+    ema_decay1: float = 0.9999
+    ema_decay2: float = 0.999943
+    use_ema: bool = False  # Enable EMA for better training stability
+    
+    # Data loading
+    use_cached_data: bool = False  # Enable cached data for faster loading
+    
+    # Mixed precision settings
+    dtype: jnp.dtype = jnp.bfloat16  # Computation dtype
+    param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
+    use_mixed_precision: bool = True
+    
+    # Attention implementation
+    attn_impl: str = "cudnn"  # or "xla"
+
+# Create a default config instance
+config = JiTConfig()
 
 # ==========================================
 # 2. RMSNorm and Utilities
@@ -90,9 +101,14 @@ CONFIG = {
 
 class RMSNorm(nnx.Module):
     """RMSNorm as used in JiT and Llama models."""
-    def __init__(self, hidden_size: int, eps: float = 1e-6, rngs: nnx.Rngs = None):
+    def __init__(self, hidden_size: int, eps: float = 1e-6,
+                 dtype: jnp.dtype = jnp.bfloat16,
+                 param_dtype: jnp.dtype = jnp.float32,
+                 rngs: nnx.Rngs = None):
         self.eps = eps
-        self.weight = nnx.Param(jnp.ones((hidden_size,)))
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.weight = nnx.Param(jnp.ones((hidden_size,), dtype=param_dtype))
 
     def __call__(self, x):
         input_dtype = x.dtype
@@ -137,8 +153,13 @@ def modulate(x, shift, scale):
 
 class ConvBottleneckPatchEmbed(nnx.Module):
     """Conv2d-based bottleneck patch embedding matching JiT reference."""
-    def __init__(self, patch_size: int, dim_bottleneck: int, dim_model: int, rngs: nnx.Rngs):
+    def __init__(self, patch_size: int, dim_bottleneck: int, dim_model: int,
+                 dtype: jnp.dtype = jnp.bfloat16,
+                 param_dtype: jnp.dtype = jnp.float32,
+                 rngs: nnx.Rngs = None):
         self.patch_size = patch_size
+        self.dtype = dtype
+        self.param_dtype = param_dtype
 
         # proj1: Conv2d with stride=patch_size (patchify + expand channels)
         self.proj1 = nnx.Conv(
@@ -147,6 +168,8 @@ class ConvBottleneckPatchEmbed(nnx.Module):
             kernel_size=(patch_size, patch_size),
             strides=(patch_size, patch_size),
             use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs
         )
         # proj2: 1x1 Conv (bottleneck projection)
@@ -155,6 +178,8 @@ class ConvBottleneckPatchEmbed(nnx.Module):
             out_features=dim_model,
             kernel_size=(1, 1),
             use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs
         )
 
@@ -255,17 +280,27 @@ def apply_rope(x, omega):
 
 class Attention(nnx.Module):
     """Multi-head attention with QK norm and RoPE (matching JiT reference)."""
-    def __init__(self, dim: int, num_heads: int, rngs: nnx.Rngs):
+    def __init__(self, dim: int, num_heads: int,
+                 dtype: jnp.dtype = jnp.bfloat16,
+                 param_dtype: jnp.dtype = jnp.float32,
+                 attn_impl: str = "cudnn",
+                 rngs: nnx.Rngs = None):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.attention_impl = _get_best_attention_implementation()
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.attn_impl = attn_impl
 
-        self.qkv = nnx.Linear(dim, dim * 3, use_bias=True, rngs=rngs)
-        self.proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.qkv = nnx.Linear(dim, dim * 3, use_bias=True,
+                             dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.proj = nnx.Linear(dim, dim,
+                              dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
         # QK Norm (applied per head)
-        self.q_norm = RMSNorm(self.head_dim, eps=1e-6, rngs=rngs)
-        self.k_norm = RMSNorm(self.head_dim, eps=1e-6, rngs=rngs)
+        self.q_norm = RMSNorm(self.head_dim, eps=1e-6,
+                             dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.k_norm = RMSNorm(self.head_dim, eps=1e-6,
+                             dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(self, x, rope=None):
         """
@@ -292,27 +327,16 @@ class Attention(nnx.Module):
             q = rope(q)
             k = rope(k)
 
-        # Flash attention implementation
-        if self.attention_impl is not None:
-            # Transpose back for flash attention: [B, H, N, D] -> [B, N, H, D]
-            q = q.transpose(0, 2, 1, 3)
-            k = k.transpose(0, 2, 1, 3)
-            v = v.transpose(0, 2, 1, 3)
-            
-            out = jax.nn.dot_product_attention(
-                q, k, v,
-                implementation=self.attention_impl,
-                is_causal=False  # Vision attention: no causal masking
-            )
-        else:
-            # Fallback to manual implementation
-            scale = self.head_dim ** -0.5
-            attn = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * scale
-            attn = jax.nn.softmax(attn, axis=-1)
-            out = jnp.matmul(attn, v)
-            # Reshape back: [B, H, N, D] -> [B, N, H, D]
-            out = out.transpose(0, 2, 1, 3)
-
+        # Transpose back for flash attention: [B, H, N, D] -> [B, N, H, D]
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        
+        out = jax.nn.dot_product_attention(
+            q, k, v,
+            implementation=self.attn_impl,
+            is_causal=False  
+        )
         # Final reshape: [B, N, H, D] -> [B, N, C]
         out = out.reshape(B, N, C)
         out = self.proj(out)
@@ -325,11 +349,18 @@ class Attention(nnx.Module):
 
 class SwiGLU(nnx.Module):
     """SwiGLU FFN as used in JiT."""
-    def __init__(self, dim: int, hidden_dim: int, rngs: nnx.Rngs):
+    def __init__(self, dim: int, hidden_dim: int,
+                 dtype: jnp.dtype = jnp.bfloat16,
+                 param_dtype: jnp.dtype = jnp.float32,
+                 rngs: nnx.Rngs = None):
         # JiT uses hidden_dim = int(mlp_ratio * dim * 2/3)
         self.hidden_dim = int(hidden_dim * 2 / 3)
-        self.w12 = nnx.Linear(dim, 2 * self.hidden_dim, use_bias=True, rngs=rngs)
-        self.w3 = nnx.Linear(self.hidden_dim, dim, use_bias=True, rngs=rngs)
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.w12 = nnx.Linear(dim, 2 * self.hidden_dim, use_bias=True,
+                             dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.w3 = nnx.Linear(self.hidden_dim, dim, use_bias=True,
+                            dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(self, x):
         x12 = self.w12(x)
@@ -344,18 +375,31 @@ class SwiGLU(nnx.Module):
 
 class JiTBlock(nnx.Module):
     """JiT transformer block with AdaLN modulation."""
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0, rngs: nnx.Rngs = None):
-        self.norm1 = RMSNorm(hidden_size, eps=1e-6, rngs=rngs)
-        self.attn = Attention(hidden_size, num_heads, rngs=rngs)
-        self.norm2 = RMSNorm(hidden_size, eps=1e-6, rngs=rngs)
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0,
+                 dtype: jnp.dtype = jnp.bfloat16,
+                 param_dtype: jnp.dtype = jnp.float32,
+                 attn_impl: str = "cudnn",
+                 rngs: nnx.Rngs = None):
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        
+        self.norm1 = RMSNorm(hidden_size, eps=1e-6,
+                            dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.attn = Attention(hidden_size, num_heads,
+                             dtype=dtype, param_dtype=param_dtype,
+                             attn_impl=attn_impl, rngs=rngs)
+        self.norm2 = RMSNorm(hidden_size, eps=1e-6,
+                            dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = SwiGLU(hidden_size, mlp_hidden_dim, rngs=rngs)
+        self.mlp = SwiGLU(hidden_size, mlp_hidden_dim,
+                          dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
         # AdaLN modulation: outputs 6 values (Sequential with SiLU + Linear, matching JiT reference)
         self.adaLN_modulation = nnx.Sequential(
             nnx.silu,
-            nnx.Linear(hidden_size, 6 * hidden_size, use_bias=True, rngs=rngs)
+            nnx.Linear(hidden_size, 6 * hidden_size, use_bias=True,
+                      dtype=dtype, param_dtype=param_dtype, rngs=rngs)
         )
 
     def __call__(self, x, c, rope=None):
@@ -382,15 +426,24 @@ class JiTBlock(nnx.Module):
 
 class FinalLayer(nnx.Module):
     """Final layer with AdaLN modulation (matching JiT reference)."""
-    def __init__(self, hidden_size: int, patch_size: int, out_channels: int, rngs: nnx.Rngs):
-        self.norm_final = RMSNorm(hidden_size, eps=1e-6, rngs=rngs)
+    def __init__(self, hidden_size: int, patch_size: int, out_channels: int,
+                 dtype: jnp.dtype = jnp.bfloat16,
+                 param_dtype: jnp.dtype = jnp.float32,
+                 rngs: nnx.Rngs = None):
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        
+        self.norm_final = RMSNorm(hidden_size, eps=1e-6,
+                                dtype=dtype, param_dtype=param_dtype, rngs=rngs)
         self.linear = nnx.Linear(
-            hidden_size, patch_size * patch_size * out_channels, use_bias=True, rngs=rngs
+            hidden_size, patch_size * patch_size * out_channels, use_bias=True,
+            dtype=dtype, param_dtype=param_dtype, rngs=rngs
         )
         # SiLU + Linear (matching JiT reference)
         self.adaLN_modulation = nnx.Sequential(
             nnx.silu,
-            nnx.Linear(hidden_size, 2 * hidden_size, use_bias=True, rngs=rngs)
+            nnx.Linear(hidden_size, 2 * hidden_size, use_bias=True,
+                      dtype=dtype, param_dtype=param_dtype, rngs=rngs)
         )
 
     def __call__(self, x, c):
@@ -406,12 +459,19 @@ class FinalLayer(nnx.Module):
 
 class TimestepEmbedder(nnx.Module):
     """Timestep embedder with sinusoidal base + MLP (matching JiT reference)."""
-    def __init__(self, hidden_size: int, freq_embed_size: int = 256, rngs: nnx.Rngs = None):
+    def __init__(self, hidden_size: int, freq_embed_size: int = 256,
+                 dtype: jnp.dtype = jnp.bfloat16,
+                 param_dtype: jnp.dtype = jnp.float32,
+                 rngs: nnx.Rngs = None):
         self.freq_embed_size = freq_embed_size
+        self.dtype = dtype
+        self.param_dtype = param_dtype
         self.mlp = nnx.Sequential(
-            nnx.Linear(freq_embed_size, hidden_size, rngs=rngs),
+            nnx.Linear(freq_embed_size, hidden_size,
+                      dtype=dtype, param_dtype=param_dtype, rngs=rngs),
             nnx.silu,
-            nnx.Linear(hidden_size, hidden_size, rngs=rngs),
+            nnx.Linear(hidden_size, hidden_size,
+                      dtype=dtype, param_dtype=param_dtype, rngs=rngs),
         )
 
     def timestep_embedding(self, t: jnp.ndarray, dim: int, max_period: float = 10000.0) -> jnp.ndarray:
@@ -441,25 +501,37 @@ class TimestepEmbedder(nnx.Module):
 
 class JiTDenoisingTransformer(nnx.Module):
     """JiT-style denoising transformer."""
-    def __init__(self, config: dict, rngs: nnx.Rngs):
-        self.config = config
+    def __init__(self, config_dict: dict, rngs: nnx.Rngs):
+        # Convert back to JiTConfig for attribute access
+        self.config = JiTConfig(**config_dict)
+        dtype = self.config.dtype
+        param_dtype = self.config.param_dtype
+        attn_impl = self.config.attn_impl
+        
         self.patch_embed = LinearBottleneckPatchEmbed(
-            config['patch_size'],
-            config['dim_bottleneck'],
-            config['dim_model'],
-            rngs
+            self.config.patch_size,
+            self.config.dim_bottleneck,
+            self.config.dim_model,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs
         )
 
         # Time embedding with sinusoidal base (matching JiT reference)
-        self.t_embedder = TimestepEmbedder(config['dim_model'], freq_embed_size=256, rngs=rngs)
+        self.t_embedder = TimestepEmbedder(
+            self.config.dim_model, freq_embed_size=256,
+            dtype=dtype, param_dtype=param_dtype, rngs=rngs
+        )
 
         # Fixed position embeddings (will be initialized)
-        num_patches = (config['img_size'] // config['patch_size']) ** 2
-        self.pos_embed = nnx.Param(jnp.zeros((1, num_patches, config['dim_model'])))
+        num_patches = (self.config.img_size // self.config.patch_size) ** 2
+        self.pos_embed = nnx.Param(
+            jnp.zeros((1, num_patches, self.config.dim_model), dtype=param_dtype)
+        )
 
         # RoPE for image patches (matching JiT reference)
-        grid_size = config['img_size'] // config['patch_size']
-        head_dim = config['dim_model'] // config['heads']
+        grid_size = self.config.img_size // self.config.patch_size
+        head_dim = self.config.dim_model // self.config.heads
         self.feat_rope = VisionRotaryEmbeddingFast(
             dim=head_dim,
             grid_size=grid_size,
@@ -469,20 +541,25 @@ class JiTDenoisingTransformer(nnx.Module):
         # JiT blocks
         self.blocks = nnx.List([
             JiTBlock(
-                hidden_size=config['dim_model'],
-                num_heads=config['heads'],
-                mlp_ratio=config['mlp_ratio'],
+                hidden_size=self.config.dim_model,
+                num_heads=self.config.heads,
+                mlp_ratio=self.config.mlp_ratio,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                attn_impl=attn_impl,
                 rngs=rngs
             )
-            for _ in range(config['depth'])
+            for _ in range(self.config.depth)
         ])
 
         # Final layer
         self.final_layer = FinalLayer(
-            config['dim_model'],
-            config['patch_size'],
-            config['channels'],
-            rngs
+            self.config.dim_model,
+            self.config.patch_size,
+            self.config.channels,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs
         )
 
         # Initialize pos embed and weights
@@ -491,8 +568,8 @@ class JiTDenoisingTransformer(nnx.Module):
 
     def _init_pos_embed(self):
         """Initialize 2D sin-cos position embeddings."""
-        grid_size = int(self.config['img_size'] // self.config['patch_size'])
-        embed_dim = self.config['dim_model']
+        grid_size = int(self.config.img_size // self.config.patch_size)
+        embed_dim = self.config.dim_model
 
         grid_h = np.arange(grid_size, dtype=np.float32)
         grid_w = np.arange(grid_size, dtype=np.float32)
@@ -551,6 +628,11 @@ class JiTDenoisingTransformer(nnx.Module):
     def __call__(self, x_noisy, t):
         # x_noisy: [B, H, W, C]
         # t: [B, 1]
+        
+        # Convert inputs to computation dtype
+        dtype = self.config.dtype
+        x_noisy = x_noisy.astype(dtype)
+        t = t.astype(dtype)
 
         # Patch embed
         x = self.patch_embed(x_noisy)  # [B, N, D]
@@ -573,9 +655,9 @@ class JiTDenoisingTransformer(nnx.Module):
 
     def _unpatchify(self, x_patches):
         B, N, D = x_patches.shape
-        p = self.config['patch_size']
+        p = self.config.patch_size
         h = w = int(math.sqrt(N))
-        C = self.config['channels']
+        C = self.config.channels
 
         x = x_patches.reshape(B, h, w, p, p, C)
         x = jnp.transpose(x, (0, 5, 1, 3, 2, 4))  # [B, C, h, p, w, p]
@@ -659,21 +741,21 @@ class PrefetchGenerator:
 # 10. Training
 # ==========================================
 
-def create_model_and_optimizer(rng_key, config, mesh):
+def create_model_and_optimizer(rng_key, config: JiTConfig, mesh):
     """Create model and optimizer with proper sharding and weight decay mask."""
     with mesh:
         rngs = nnx.Rngs(rng_key)
-        model = JiTDenoisingTransformer(config, rngs)
+        model = JiTDenoisingTransformer(config.__dict__, rngs)
 
         # Initialize with dummy data
-        dummy_x = jnp.ones((1, config['img_size'], config['img_size'], config['channels']))
+        dummy_x = jnp.ones((1, config.img_size, config.img_size, config.channels))
         dummy_t = jnp.ones((1, 1))
         _ = model(dummy_x, dummy_t)
 
         # Constant LR (matching JiT reference - no decay)
         tx = optax.adamw(
-            learning_rate=config['lr'],
-            weight_decay=config['weight_decay'],
+            learning_rate=config.lr,
+            weight_decay=config.weight_decay,
         )
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
@@ -737,7 +819,9 @@ def get_lr(step, total_steps, config):
 
 def train_step_fn(model, batch, rng, P_mean, P_std, noise_scale, t_eps):
     """Training step logic (not JIT'd - JIT applied in trainer loop)."""
-    x_clean = batch  # [B, H, W, C]
+    # Convert batch to model's computation dtype
+    dtype = model.config.get('dtype', jnp.bfloat16)
+    x_clean = batch.astype(dtype)  # [B, H, W, C]
     B = x_clean.shape[0]
 
     rng, t_rng, n_rng = jax.random.split(rng, 3)
@@ -812,49 +896,53 @@ def main():
     mesh = Mesh(devices, ["devices"])
 
     print("\n[1/5] Setting up data loader...", flush=True)
-    if CONFIG.get('use_cached_data', True):
-        if not is_cached(CONFIG['img_size'], "train"):
+    print(f"    Mixed precision: {config.use_mixed_precision}", flush=True)
+    print(f"    Computation dtype: {config.dtype}", flush=True)
+    print(f"    Parameter dtype: {config.param_dtype}", flush=True)
+    if config.use_cached_data:
+        if not is_cached(config.img_size, "train"):
             print("    Cached data not found. Caching dataset (one-time setup)...", flush=True)
-            cache_dataset(CONFIG['img_size'])
+            cache_dataset(config.img_size)
 
         data_cfg = CachedDataConfig(
-            batch_size=CONFIG['batch_size'],
-            img_size=CONFIG['img_size'],
-            seed=CONFIG['seed'],
+            batch_size=config.batch_size,
+            img_size=config.img_size,
+            seed=config.seed,
             shuffle=True,
         )
         train_gen_raw = make_cached_dataloader("train", data_cfg)
-        train_gen = PrefetchGenerator(train_gen_raw, buffer_size=8)
-        print(f"    Using cached data with prefetch buffer: 8 batches", flush=True)
+        # Increase prefetch buffer for better data pipeline overlap with mixed precision
+        train_gen = PrefetchGenerator(train_gen_raw, buffer_size=12)
+        print(f"    Using cached data with prefetch buffer: 12 batches", flush=True)
         num_train_samples = 162000
     else:
         train_gen_raw = celeba_generator_hf(
             split="train",
-            batch_size=CONFIG['batch_size'],
-            img_size=CONFIG['img_size'],
-            seed=CONFIG['seed']
+            batch_size=config.batch_size,
+            img_size=config.img_size,
+            seed=config.seed
         )
         train_gen = PrefetchGenerator(train_gen_raw, buffer_size=4)
         print(f"    Using streaming data with prefetch buffer: 4 batches", flush=True)
         num_train_samples = 162000
 
-    steps_per_epoch = num_train_samples // CONFIG['batch_size']
-    num_epochs = CONFIG['epochs']
+    steps_per_epoch = num_train_samples // config.batch_size
+    num_epochs = config.epochs
     sample_every = 2000
     total_steps = steps_per_epoch * num_epochs
 
     # Setup model
     print("[2/5] Initializing model...", flush=True)
-    rng = jax.random.PRNGKey(CONFIG['seed'])
+    rng = jax.random.PRNGKey(config.seed)
     rng, init_rng = jax.random.split(rng)
 
-    model, optimizer = create_model_and_optimizer(init_rng, CONFIG, mesh)
-    print(f"    Model: {CONFIG['dim_model']}d, {CONFIG['depth']} layers", flush=True)
-    print(f"    Batch size: {CONFIG['batch_size']}, LR: {CONFIG['lr']}", flush=True)
+    model, optimizer = create_model_and_optimizer(init_rng, config, mesh)
+    print(f"    Model: {config.dim_model}d, {config.depth} layers", flush=True)
+    print(f"    Batch size: {config.batch_size}, LR: {config.lr}", flush=True)
 
     # Setup EMA
-    ema_tracker = EMATracker(model, CONFIG['ema_decay1'], CONFIG['ema_decay2'])
-    print(f"    EMA decays: {CONFIG['ema_decay1']}, {CONFIG['ema_decay2']}", flush=True)
+    ema_tracker = EMATracker(model, config.ema_decay1, config.ema_decay2)
+    print(f"    EMA decays: {config.ema_decay1}, {config.ema_decay2}", flush=True)
 
     # Setup output
     output_dir = "generated_samples_jit"
@@ -894,8 +982,8 @@ def main():
         print(f"Training batch sample saved: {os.path.join(output_dir, 'training_batch_sample.png')}", flush=True)
 
         print("\nGenerating pre-training sample...", flush=True)
-        pretrain_sample = sample(model, rng, img_size=CONFIG['img_size'],
-                                 noise_scale=CONFIG['noise_scale'], t_eps=CONFIG['t_eps'])
+        pretrain_sample = sample(model, rng, img_size=config.img_size,
+                                 noise_scale=config.noise_scale, t_eps=config.t_eps)
         img = np.array(pretrain_sample[0])
         img = (img + 1.0) / 2.0
         img = np.clip(img, 0, 1)
@@ -921,7 +1009,7 @@ def main():
 
                 loss, grads, rng = train_step_jit(
                     model, batch, rng,
-                    CONFIG['P_mean'], CONFIG['P_std'], CONFIG['noise_scale'], CONFIG['t_eps']
+                    config.P_mean, config.P_std, config.noise_scale, config.t_eps
                 )
                 optimizer.update(model, grads)
                 epoch_losses.append(float(loss))
@@ -934,7 +1022,7 @@ def main():
 
                 if step_in_epoch % 50 == 0:
                     avg_step_time = sum(step_times) / len(step_times)
-                    samples_per_sec = CONFIG['batch_size'] / avg_step_time
+                    samples_per_sec = config.batch_size / avg_step_time
                     steps_remaining = total_steps - global_step
                     eta_seconds = steps_remaining * avg_step_time
                     eta_str = str(timedelta(seconds=int(eta_seconds)))
@@ -946,12 +1034,12 @@ def main():
 
                 if global_step % sample_every == 0 and global_step > 0:
                     print(f"Sampling at step {global_step}...", flush=True)
-                    if CONFIG.get('use_ema', True):
+                    if config.use_ema:
                         sample_model = ema_tracker.apply_to_model(model)
                     else:
                         sample_model = model
-                    sample_out = sample(sample_model, rng, img_size=CONFIG['img_size'],
-                                        noise_scale=CONFIG['noise_scale'], t_eps=CONFIG['t_eps'])
+                    sample_out = sample(sample_model, rng, img_size=config.img_size,
+                                        noise_scale=config.noise_scale, t_eps=config.t_eps)
 
                     img = np.array(sample_out[0])
                     img = (img + 1.0) / 2.0
@@ -973,7 +1061,7 @@ def main():
                 global_step += 1
 
             epoch_time = time.perf_counter() - epoch_start
-            epoch_samples = steps_per_epoch * CONFIG['batch_size']
+            epoch_samples = steps_per_epoch * config.batch_size
             epoch_samples_per_sec = epoch_samples / epoch_time
             print(f"Epoch {epoch+1} completed in {timedelta(seconds=int(epoch_time))} "
                   f"({epoch_samples_per_sec:.1f} samples/sec)", flush=True)
