@@ -134,7 +134,7 @@ source \$HOME/.local/bin/env 2>/dev/null
 tmux kill-session -t $SESSION_NAME 2>/dev/null || true
 tmux new-session -d -s $SESSION_NAME -c "\$REMOTE_DIR"
 tmux send-keys -t $SESSION_NAME "source \$HOME/.local/bin/env 2>/dev/null" Enter
-tmux send-keys -t $SESSION_NAME "${hf_export}uv run python $SCRIPT_PATH $SCRIPT_ARGS 2>&1 | tee $log_file" Enter
+tmux send-keys -t $SESSION_NAME "${hf_export}PYTHONUNBUFFERED=1 uv run python $SCRIPT_PATH $SCRIPT_ARGS 2>&1 | tee $log_file" Enter
 echo "Session '$SESSION_NAME' started"
 EOF
     echo -e "${GREEN}Script running.${NC} Use: $0 $SSH_HOST attach"

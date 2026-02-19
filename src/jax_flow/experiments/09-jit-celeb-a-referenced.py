@@ -61,7 +61,7 @@ class JiTConfig:
     channels: int = 3
     dim_bottleneck: int = 32
     dim_model: int = 256
-    depth: int = 2
+    depth: int = 8
     heads: int = 8
     mlp_ratio: float = 4.0
 
