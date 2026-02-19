@@ -37,15 +37,15 @@ import orbax.checkpoint as ocp
 # 1. Configuration (Matching JiT official)
 # ==========================================
 CONFIG = {
-    "img_size": 64,
-    "patch_size": 4,
+    "img_size": 128,
+    "patch_size": 8,
     "channels": 3,
     "dim_bottleneck": 32,
     "dim_model": 192,
     "depth": 6,
     "heads": 8,
     "mlp_ratio": 4.0,
-    "batch_size": 64,
+    "batch_size": 32,
     "lr": 1e-4,
     "epochs": 50,
     "warmup_epochs": 5,
