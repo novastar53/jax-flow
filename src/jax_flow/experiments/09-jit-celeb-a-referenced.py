@@ -549,12 +549,14 @@ class JiTDenoisingTransformer(nnx.Module):
 # 9. Data Loading
 # ==========================================
 
-def celeba_generator_hf(split="train", batch_size=32, img_size=64):
-    """HuggingFace-based CelebA dataloader."""
+def celeba_generator_hf(split="train", batch_size=32, img_size=64, seed=42):
+    """HuggingFace-based CelebA dataloader with shuffling before each epoch."""
     print(f"Loading CelebA dataset from HuggingFace (split={split})...", flush=True)
     ds = load_dataset("flwrlabs/celeba", split=split, streaming=True)
     print(f"Dataset loaded successfully! Starting data stream...", flush=True)
 
+    epoch = 0
+    ds = ds.shuffle(seed=seed, buffer_size=10_000)
     ds_iterator = iter(ds)
 
     while True:
@@ -573,6 +575,8 @@ def celeba_generator_hf(split="train", batch_size=32, img_size=64):
 
                 batch_imgs.append(img_array)
             except StopIteration:
+                epoch += 1
+                ds = ds.shuffle(seed=seed + epoch, buffer_size=10_000)
                 ds_iterator = iter(ds)
                 break
 
@@ -773,7 +777,8 @@ def main():
     train_gen = celeba_generator_hf(
         split="train",
         batch_size=CONFIG['batch_size'],
-        img_size=CONFIG['img_size']
+        img_size=CONFIG['img_size'],
+        seed=CONFIG['seed']
     )
     # Wrap with prefetch generator to overlap data loading with GPU compute
     train_gen = PrefetchGenerator(train_gen, buffer_size=4)
@@ -824,6 +829,19 @@ def main():
         first_batch = next(train_gen)
         print(f"\nDebug - First batch: shape={first_batch.shape}, "
               f"range=[{first_batch.min():.3f}, {first_batch.max():.3f}]", flush=True)
+
+        # Save a row of training images from first batch
+        train_imgs = first_batch[:8]
+        train_imgs = (train_imgs + 1.0) / 2.0
+        fig, axes = plt.subplots(1, 8, figsize=(16, 2))
+        for i, ax in enumerate(axes):
+            ax.imshow(train_imgs[i])
+            ax.axis('off')
+        plt.suptitle('Training Images (First Batch)')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "training_batch_sample.png"), dpi=150)
+        plt.close()
+        print(f"Training batch sample saved: {os.path.join(output_dir, 'training_batch_sample.png')}", flush=True)
 
         # Generate a sample before training to verify sampling works
         print("\nGenerating pre-training sample...", flush=True)
