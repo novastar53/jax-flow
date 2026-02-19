@@ -84,13 +84,13 @@ class JiTConfig:
     # Data loading
     use_cached_data: bool = False  # Enable cached data for faster loading
     
-    # Mixed precision settings
-    dtype: jnp.dtype = jnp.bfloat16  # Computation dtype
+    # Mixed precision settings - automatically adjust based on platform
+    dtype: jnp.dtype = None  # Will be set based on platform
     param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
     use_mixed_precision: bool = True
     
     # Attention implementation
-    attn_impl: str = "cudnn"  # or "xla"
+    attn_impl: str = "cudnn"  # Use cuDNN for flash attention
 
 # Create a default config instance
 config = JiTConfig()
@@ -111,13 +111,15 @@ class RMSNorm(nnx.Module):
         self.weight = nnx.Param(jnp.ones((hidden_size,), dtype=param_dtype))
 
     def __call__(self, x):
+        # RMSNorm should preserve the input dtype
         input_dtype = x.dtype
         x = x.astype(jnp.float32)
         variance = jnp.mean(x ** 2, axis=-1, keepdims=True)
         # Use rsqrt like PyTorch reference
         x = x * jax.lax.rsqrt(variance + self.eps)
         x = x.astype(input_dtype)
-        return x * self.weight.value
+        # Convert weight to match computation dtype
+        return x * self.weight.value.astype(input_dtype)
 
 
 def rotate_half(x):
@@ -629,10 +631,11 @@ class JiTDenoisingTransformer(nnx.Module):
         # x_noisy: [B, H, W, C]
         # t: [B, 1]
         
-        # Convert inputs to computation dtype
-        dtype = self.config.dtype
-        x_noisy = x_noisy.astype(dtype)
-        t = t.astype(dtype)
+        # Ensure inputs are in the model's computation dtype
+        if x_noisy.dtype != self.config.dtype:
+            x_noisy = x_noisy.astype(self.config.dtype)
+        if t.dtype != self.config.dtype:
+            t = t.astype(self.config.dtype)
 
         # Patch embed
         x = self.patch_embed(x_noisy)  # [B, N, D]
@@ -747,9 +750,9 @@ def create_model_and_optimizer(rng_key, config: JiTConfig, mesh):
         rngs = nnx.Rngs(rng_key)
         model = JiTDenoisingTransformer(config.__dict__, rngs)
 
-        # Initialize with dummy data
-        dummy_x = jnp.ones((1, config.img_size, config.img_size, config.channels))
-        dummy_t = jnp.ones((1, 1))
+        # Initialize with dummy data in the correct dtype
+        dummy_x = jnp.ones((1, config.img_size, config.img_size, config.channels), dtype=config.dtype)
+        dummy_t = jnp.ones((1, 1), dtype=config.dtype)
         _ = model(dummy_x, dummy_t)
 
         # Constant LR (matching JiT reference - no decay)
@@ -819,9 +822,8 @@ def get_lr(step, total_steps, config):
 
 def train_step_fn(model, batch, rng, P_mean, P_std, noise_scale, t_eps):
     """Training step logic (not JIT'd - JIT applied in trainer loop)."""
-    # Convert batch to model's computation dtype
-    dtype = model.config.get('dtype', jnp.bfloat16)
-    x_clean = batch.astype(dtype)  # [B, H, W, C]
+    # Convert numpy batch to correct JAX dtype
+    x_clean = jnp.asarray(batch, dtype=model.config.dtype)  # [B, H, W, C]
     B = x_clean.shape[0]
 
     rng, t_rng, n_rng = jax.random.split(rng, 3)
@@ -859,14 +861,16 @@ def sample(model, rng, img_size, steps=50, noise_scale=1.0, t_eps=1e-3, batch_si
     """Generate samples using Euler method (matching JiT reference)."""
     print(f"Sampling with {steps} steps...", flush=True)
 
-    x_current = jax.random.normal(rng, (batch_size, img_size, img_size, 3)) * noise_scale
+    # Use model's dtype for sampling
+    model_dtype = model.config.dtype
+    x_current = jax.random.normal(rng, (batch_size, img_size, img_size, 3), dtype=model_dtype) * noise_scale
     # Use linspace from 0 to 0.99 with steps+1 points (don't go all the way to 1.0 to avoid instability)
     # This gives us 'steps' intervals to iterate through
     t_values = np.linspace(0.0, 0.99, steps + 1)
     dt = t_values[1] - t_values[0]
 
     for t_scalar in t_values[:-1]:
-        t_vec = jnp.ones((batch_size, 1)) * t_scalar
+        t_vec = jnp.ones((batch_size, 1), dtype=model_dtype) * t_scalar
         # Model predicts the clean image x_1 from the current noised state
         x_clean_pred = model(x_current, t_vec)
         # Compute velocity: v = (x_1 - x_t) / (1 - t)
@@ -885,7 +889,7 @@ def sample(model, rng, img_size, steps=50, noise_scale=1.0, t_eps=1e-3, batch_si
 
 def main():
     print("=" * 60, flush=True)
-    print("JiT Denoising Training (CelebA 64x64)", flush=True)
+    print("JiT Denoising Training (CelebA 128x128)", flush=True)
     print("=" * 60, flush=True)
 
     # Setup devices and mesh
@@ -896,9 +900,6 @@ def main():
     mesh = Mesh(devices, ["devices"])
 
     print("\n[1/5] Setting up data loader...", flush=True)
-    print(f"    Mixed precision: {config.use_mixed_precision}", flush=True)
-    print(f"    Computation dtype: {config.dtype}", flush=True)
-    print(f"    Parameter dtype: {config.param_dtype}", flush=True)
     if config.use_cached_data:
         if not is_cached(config.img_size, "train"):
             print("    Cached data not found. Caching dataset (one-time setup)...", flush=True)
