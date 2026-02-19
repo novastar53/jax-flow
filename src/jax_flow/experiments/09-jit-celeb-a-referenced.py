@@ -41,7 +41,7 @@ CONFIG = {
     "patch_size": 8,
     "channels": 3,
     "dim_bottleneck": 32,
-    "dim_model": 192,
+    "dim_model": 256,
     "depth": 8,
     "heads": 8,
     "mlp_ratio": 4.0,
