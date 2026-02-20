@@ -5,9 +5,7 @@ Uses AdaLN modulation, SwiGLU, QK norm, and proper training configuration.
 
 import sys
 import os
-import threading
 from pprint import pprint
-import queue
 import time
 from datetime import datetime, timedelta
 from typing import List, Literal
@@ -629,34 +627,7 @@ def celeba_generator_hf(split="train", batch_size=32, img_size=64, seed=42):
             yield batch, None
 
 
-class PrefetchGenerator:
-    """Prefetch batches in a background thread to overlap data loading with GPU compute."""
-    def __init__(self, generator, buffer_size=4):
-        self.generator = generator
-        self.buffer_size = buffer_size
-        self.queue = queue.Queue(maxsize=buffer_size)
-        self.thread = threading.Thread(target=self._prefetch_loop, daemon=True)
-        self.thread.start()
 
-    def _prefetch_loop(self):
-        """Background thread that fills the prefetch queue."""
-        try:
-            for item in self.generator:
-                self.queue.put(item)
-        except StopIteration:
-            pass
-        # Signal end with None
-        for _ in range(self.buffer_size):
-            self.queue.put(None)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        item = self.queue.get()
-        if item is None:
-            raise StopIteration
-        return item
 
 
 class EMATracker:
@@ -810,7 +781,7 @@ def main():
         step_times = []
         training_start = time.perf_counter()
         for epoch in range(num_epochs):
-            train_gen = PrefetchGenerator(train_gen_raw, buffer_size=16)
+            train_gen = train_gen_raw
             print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===")
             epoch_losses = []
             epoch_start = time.perf_counter()
