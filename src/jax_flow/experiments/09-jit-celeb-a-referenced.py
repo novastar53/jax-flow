@@ -776,10 +776,8 @@ def main():
             shuffle=True,
         )
         train_gen_raw = make_cached_dataloader("train", data_cfg)
-        # Increase prefetch buffer for better data pipeline overlap with mixed precision
         train_gen = PrefetchGenerator(train_gen_raw, buffer_size=12)
         print(f"    Using cached data with prefetch buffer: 12 batches")
-        num_train_samples = 162000
     else:
         train_gen_raw = celeba_generator_hf(
             split="train",
@@ -787,10 +785,10 @@ def main():
             img_size=config.img_size,
             seed=config.seed
         )
-        train_gen = PrefetchGenerator(train_gen_raw, buffer_size=4)
+        train_gen = PrefetchGenerator(train_gen_raw, buffer_size=16)
         print(f"    Using streaming data with prefetch buffer: 4 batches")
-        num_train_samples = 162000
 
+    num_train_samples = 162000
     steps_per_epoch = num_train_samples // config.batch_size
     num_epochs = config.epochs
     sample_every = 2000
