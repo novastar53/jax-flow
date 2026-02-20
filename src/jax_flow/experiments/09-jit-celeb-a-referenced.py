@@ -762,6 +762,9 @@ def main():
     print("=" * 60)
     print("JiT Denoising Training (CelebA 128x128)")
     print("=" * 60)
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(config.output_dir, exist_ok=True)
 
     print("\n[1/5] Setting up data loader...")
     if config.use_cached_data:
