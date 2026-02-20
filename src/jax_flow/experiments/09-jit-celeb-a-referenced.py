@@ -26,7 +26,7 @@ mesh = Mesh(devices, ["devices"])
 
 
 # Enable mixed precision matmul for better performance
-if platform == "cuda":
+if platform == "gpu":
     jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
 
 import jax.numpy as jnp
@@ -95,7 +95,7 @@ class JiTConfig:
     param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
     
     # Attention implementation
-    attn_impl: Literal["xla", "cudnn"] = "cudnn" if platform == "cuda" else "xla"
+    attn_impl: Literal["xla", "cudnn"] = "cudnn" if platform == "gpu" else "xla"
     output_dir: str = "generated_samples_jit"
 
 config = JiTConfig()
@@ -780,7 +780,6 @@ def main():
         )
         train_gen_raw = make_cached_dataloader("train", data_cfg)
         train_gen = PrefetchGenerator(train_gen_raw, buffer_size=12)
-        print(f"    Using cached data with prefetch buffer: 12 batches")
     else:
         train_gen_raw = celeba_generator_hf(
             split="train",
@@ -789,7 +788,6 @@ def main():
             seed=config.seed
         )
         train_gen = PrefetchGenerator(train_gen_raw, buffer_size=16)
-        print(f"    Using streaming data with prefetch buffer: 4 batches")
 
     num_train_samples = 162000
     steps_per_epoch = num_train_samples // config.batch_size
