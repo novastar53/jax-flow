@@ -779,7 +779,6 @@ def main():
             shuffle=True,
         )
         train_gen_raw = make_cached_dataloader("train", data_cfg)
-        train_gen = PrefetchGenerator(train_gen_raw, buffer_size=12)
     else:
         train_gen_raw = celeba_generator_hf(
             split="train",
@@ -787,7 +786,6 @@ def main():
             img_size=config.img_size,
             seed=config.seed
         )
-        train_gen = PrefetchGenerator(train_gen_raw, buffer_size=16)
 
     num_train_samples = 162000
     steps_per_epoch = num_train_samples // config.batch_size
@@ -811,40 +809,8 @@ def main():
         global_step = 0
         step_times = []
         training_start = time.perf_counter()
-
-        first_batch, _ = next(train_gen)
-        print(f"\nDebug - First batch: shape={first_batch.shape}, "
-              f"range=[{first_batch.min():.3f}, {first_batch.max():.3f}]")
-
-        train_imgs = first_batch[:8]
-        train_imgs = (train_imgs + 1.0) / 2.0
-        fig, axes = plt.subplots(1, 8, figsize=(16, 2))
-        for i, ax in enumerate(axes):
-            ax.imshow(train_imgs[i])
-            ax.axis('off')
-        plt.suptitle('Training Images (First Batch)')
-        plt.tight_layout()
-        plt.savefig(os.path.join(config.output_dir, "training_batch_sample.png"), dpi=150)
-        plt.close()
-        print(f"Training batch sample saved: {os.path.join(config.output_dir, 'training_batch_sample.png')}")
-
-        print("\nGenerating pre-training sample...")
-        pretrain_sample = sample(model, rng, img_size=config.img_size,
-                                 noise_scale=config.noise_scale, t_eps=config.t_eps)
-        img = np.array(pretrain_sample[0])
-        img = (img + 1.0) / 2.0
-        img = np.clip(img, 0, 1)
-        filepath = os.path.join(config.output_dir, "sample_pretraining.png")
-        plt.figure(figsize=(4, 4))
-        plt.imshow(img)
-        plt.axis('off')
-        plt.title("Pre-training Sample (Random Init)")
-        plt.tight_layout()
-        plt.savefig(filepath, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Pre-training sample saved: {filepath}")
-
         for epoch in range(num_epochs):
+            train_gen = PrefetchGenerator(train_gen_raw, buffer_size=16)
             print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===")
             epoch_losses = []
             epoch_start = time.perf_counter()
