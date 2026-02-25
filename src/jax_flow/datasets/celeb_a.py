@@ -199,6 +199,7 @@ def _get_arrays(cfg: DataConfig):
     # Backend selection: default prefers huggingface (no Google Drive rate limits), but can be forced with env var
     import os
     backend = os.environ.get('CELEBA_BACKEND', 'auto').lower()
+    print(f"[CelebA] Using backend: {backend}")
 
     # If forced to huggingface, try only that
     if backend == 'huggingface':
