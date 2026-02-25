@@ -73,6 +73,72 @@ def _load_from_tfds(sample_size: Optional[int] = None):
     return (train, test)
 
 
+def _load_from_huggingface(sample_size: Optional[int] = None, image_size=(128, 128)):
+    """Load CelebA from Hugging Face datasets (bypasses Google Drive rate limits)."""
+    try:
+        from datasets import load_dataset
+        from PIL import Image
+        import io
+    except Exception:
+        return None
+
+    def ds_to_arrays(split: str):
+        try:
+            # Use huggan/CelebA-faces-with-attributes dataset
+            ds = load_dataset("huggan/CelebA-faces-with-attributes", split=split, trust_remote_code=True)
+        except Exception as e:
+            return None
+
+        imgs = []
+        attrs = []
+        for i, item in enumerate(ds):
+            # Extract image - dataset has 'image' field with PIL images
+            img = item.get('image')
+            if img is None:
+                continue
+
+            # Convert PIL to numpy, resize, and normalize
+            img_resized = img.resize(image_size, Image.BILINEAR)
+            arr = np.array(img_resized).astype(np.float32) / 255.0
+
+            # Ensure HWC format (add channel dim if grayscale)
+            if arr.ndim == 2:
+                arr = np.expand_dims(arr, -1)
+            # Ensure 3 channels
+            if arr.shape[2] == 1:
+                arr = np.repeat(arr, 3, axis=-1)
+            elif arr.shape[2] == 4:
+                arr = arr[:, :, :3]  # Drop alpha channel
+
+            imgs.append(arr)
+
+            # Extract attributes if available
+            attr = item.get('attributes', {})
+            if isinstance(attr, dict) and len(attr) > 0:
+                # Use first attribute as label, or 0 if no attributes
+                attrs.append(list(attr.values())[0] if attr else 0)
+            else:
+                attrs.append(0)
+
+            if sample_size is not None and len(imgs) >= sample_size:
+                break
+
+        if not imgs:
+            return None
+        return np.stack(imgs, axis=0), np.array(attrs, dtype=np.int64)
+
+    try:
+        train = ds_to_arrays('train')
+        test = ds_to_arrays('test')
+    except Exception:
+        train = None
+        test = None
+
+    if train is None and test is None:
+        return None
+    return (train, test)
+
+
 def _load_from_torchvision(sample_size: Optional[int] = None, image_size=(128, 128)):
     try:
         from torchvision import datasets, transforms  # type: ignore
@@ -130,9 +196,16 @@ def _load_from_torchvision(sample_size: Optional[int] = None, image_size=(128, 1
 
 
 def _get_arrays(cfg: DataConfig):
-    # Backend selection: default prefers torchvision, but can be forced with env var
+    # Backend selection: default prefers huggingface (no Google Drive rate limits), but can be forced with env var
     import os
     backend = os.environ.get('CELEBA_BACKEND', 'auto').lower()
+
+    # If forced to huggingface, try only that
+    if backend == 'huggingface':
+        res = _load_from_huggingface(sample_size=cfg.sample_size, image_size=cfg.image_size)
+        if res is None:
+            raise RuntimeError('Hugging Face backend requested via CELEBA_BACKEND but datasets library is not available or failed')
+        return res
 
     # If forced to torchvision, try only that and raise a helpful error if unavailable
     if backend == 'torchvision':
@@ -151,7 +224,11 @@ def _get_arrays(cfg: DataConfig):
             raise RuntimeError('TFDS backend requested via CELEBA_BACKEND but tensorflow_datasets is not available or failed')
         return res
 
-    # auto: prefer torchvision, otherwise try TFDS (with safe fallback if TFDS raises download errors)
+    # auto: prefer huggingface (no rate limits), then torchvision, then TFDS
+    res = _load_from_huggingface(sample_size=cfg.sample_size, image_size=cfg.image_size)
+    if res is not None:
+        return res
+
     res = _load_from_torchvision(sample_size=cfg.sample_size, image_size=cfg.image_size)
     if res is not None:
         return res
@@ -161,13 +238,13 @@ def _get_arrays(cfg: DataConfig):
     except Exception as e:
         # TFDS could fail due to download/checksum issues (Google Drive redirects). Provide a helpful message.
         import warnings
-        warnings.warn(f'TFDS backend failed with error: {e}. If you prefer torchvision, install it (`pip install torchvision`) and set CELEBA_BACKEND=torchvision')
+        warnings.warn(f'TFDS backend failed with error: {e}. Try using Hugging Face backend: `pip install datasets` and set CELEBA_BACKEND=huggingface')
         return None
     if res is not None:
         return res
     raise RuntimeError(
-        "Could not load CelebA: please install tensorflow-datasets (`pip install tensorflow-datasets`) "
-        "or torchvision (`pip install torchvision`)."
+        "Could not load CelebA: please install datasets (`pip install datasets`), "
+        "torchvision (`pip install torchvision`), or tensorflow-datasets (`pip install tensorflow-datasets`)."
     )
 
 
